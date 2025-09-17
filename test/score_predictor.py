@@ -154,9 +154,6 @@ def main():
     np.save(os.path.join(OUTPUT_DIR, 'rot_score.npy'), rot_score)
     np.save(os.path.join(OUTPUT_DIR, 'trans_score.npy'), trans_score)
     
-    # 保存原始PDB特征用于对比
-    np.save(os.path.join(OUTPUT_DIR, 'original_coords.npy'), np.array(pdb_feats['atom_positions']))
-    
     print(f"预测完成！结果已保存到 {OUTPUT_DIR}")
     print(f"- 旋转score形状: {rot_score.shape}")
     print(f"- 平移score形状: {trans_score.shape}")
