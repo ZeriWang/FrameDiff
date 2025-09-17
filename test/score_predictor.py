@@ -36,8 +36,22 @@ def process_chain_feats(pdb_feats):
 def main():
     # 加载配置
     conf = OmegaConf.load(CONF_PATH)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {device}")
+    
+    # 优先使用GPU，并进行详细的设备检查
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')  # 明确指定第一个GPU
+        torch.cuda.set_device(0)  # 设置当前设备
+        print(f"使用设备: {device}")
+        print(f"GPU名称: {torch.cuda.get_device_name(0)}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(f"当前可用GPU内存: {torch.cuda.memory_reserved(0) / 1024**3:.1f} GB")
+        
+        # 清理GPU缓存
+        torch.cuda.empty_cache()
+    else:
+        device = torch.device('cpu')
+        print(f"CUDA不可用，使用设备: {device}")
+        print("警告: 使用CPU可能会显著增加推理时间")
 
     # 加载PDB并预处理
     print(f"加载PDB文件: {PDB_PATH}")
@@ -55,6 +69,15 @@ def main():
     model = score_network.ScoreNetwork(conf.model, diffuser)
     model.to(device)
     model.eval()
+    
+    # 如果使用GPU，启用一些优化
+    if device.type == 'cuda':
+        # 启用cudnn基准模式以优化性能
+        torch.backends.cudnn.benchmark = True
+        # 启用内存高效的注意力机制（如果支持）
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("已启用GPU优化设置")
 
     # 加载权重
     print(f"加载模型权重: {WEIGHTS_PATH}")
@@ -108,8 +131,18 @@ def main():
 
     # 推理
     print("开始预测对数概率密度梯度...")
+    
+    # 如果使用GPU，显示推理前的内存使用情况
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()  # 清理缓存
+        print(f"推理前GPU内存使用: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+    
     with torch.no_grad():
         output = model(input_feats)
+    
+    # 推理后的内存情况
+    if device.type == 'cuda':
+        print(f"推理后GPU内存使用: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
 
     # 保存结果
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -117,11 +150,9 @@ def main():
     # 保存score预测结果
     rot_score = output['rot_score'].cpu().numpy().squeeze()
     trans_score = output['trans_score'].cpu().numpy().squeeze()
-    psi_pred = output['psi'].cpu().numpy().squeeze()
     
     np.save(os.path.join(OUTPUT_DIR, 'rot_score.npy'), rot_score)
     np.save(os.path.join(OUTPUT_DIR, 'trans_score.npy'), trans_score)
-    np.save(os.path.join(OUTPUT_DIR, 'psi_pred.npy'), psi_pred)
     
     # 保存原始PDB特征用于对比
     np.save(os.path.join(OUTPUT_DIR, 'original_coords.npy'), np.array(pdb_feats['atom_positions']))
@@ -129,7 +160,6 @@ def main():
     print(f"预测完成！结果已保存到 {OUTPUT_DIR}")
     print(f"- 旋转score形状: {rot_score.shape}")
     print(f"- 平移score形状: {trans_score.shape}")
-    print(f"- Psi角预测形状: {psi_pred.shape}")
 
 if __name__ == '__main__':
 	main()
