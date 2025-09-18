@@ -10,7 +10,7 @@ from openfold.data import data_transforms
 from openfold.utils import rigid_utils as ru
 
 # 输入参数
-PDB_PATH = '/home/zeriwang/lab/FrameDiff/test/pdb_dir/3HTN.pdb'
+PDB_PATH = '/home/zeriwang/lab/FrameDiff/test/pdb_dir/4AKE.pdb'
 OUTPUT_DIR = '/home/zeriwang/lab/FrameDiff/test/output_dir'
 WEIGHTS_PATH = '/home/zeriwang/lab/FrameDiff/weights/best_weights.pth'
 CONF_PATH = '/home/zeriwang/lab/FrameDiff/config/base.yaml'
@@ -59,7 +59,8 @@ def main():
     
     # 处理链特征
     chain_feats = process_chain_feats(pdb_feats)
-    num_res = len(pdb_feats['aatype'])
+    bb_mask = pdb_feats['bb_mask'].astype(bool)
+    num_res = int(np.sum(bb_mask))
     print(f"蛋白质长度: {num_res} 个残基")
 
     # 构造diffuser
@@ -87,9 +88,12 @@ def main():
     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     model.load_state_dict(state_dict)
 
-    # 组装输入特征
+    # 组装输入特征（全部裁剪到有效残基）
     res_mask = np.ones(num_res, dtype=np.float32)
-    fixed_mask = np.zeros_like(res_mask)  # 所有残基都是可扩散的
+    fixed_mask = np.zeros_like(res_mask)
+    seq_idx = np.arange(1, num_res+1)
+    torsion_angles_sin_cos = chain_feats['torsion_angles_sin_cos'].numpy()[bb_mask]
+    sc_ca_t = np.zeros((num_res, 3))
     
     # 从diffuser采样参考结构
     ref_sample = diffuser.sample_ref(
@@ -98,16 +102,16 @@ def main():
     )
     
     # 设置时间相关特征
-    t = 0.5  # 中间时间步
+    t = 0  # 中间时间步
     rot_score_scaling, trans_score_scaling = diffuser.score_scaling(t)
     
     # 构造输入字典，包含所有必要特征
     input_feats = {
         'res_mask': res_mask,
-        'seq_idx': np.arange(1, num_res+1),
+        'seq_idx': seq_idx,
         'fixed_mask': fixed_mask,
-        'torsion_angles_sin_cos': chain_feats['torsion_angles_sin_cos'].numpy(),
-        'sc_ca_t': np.zeros((num_res, 3)),
+        'torsion_angles_sin_cos': torsion_angles_sin_cos,
+        'sc_ca_t': sc_ca_t,
         'rot_score_scaling': np.array([rot_score_scaling]),
         'trans_score_scaling': np.array([trans_score_scaling]),
         **ref_sample,
