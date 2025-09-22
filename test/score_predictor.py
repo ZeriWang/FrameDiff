@@ -10,7 +10,7 @@ from openfold.data import data_transforms
 from openfold.utils import rigid_utils as ru
 
 # 输入参数
-PDB_PATH = '/home/zeriwang/lab/FrameDiff/test/pdb_dir/4AKE.pdb'
+PDB_PATH = '/home/zeriwang/lab/FrameDiff/test/pdb_dir/1AKE.pdb'
 OUTPUT_DIR = '/home/zeriwang/lab/FrameDiff/test/output_dir'
 WEIGHTS_PATH = '/home/zeriwang/lab/FrameDiff/weights/best_weights.pth'
 CONF_PATH = '/home/zeriwang/lab/FrameDiff/config/base.yaml'
@@ -102,7 +102,7 @@ def main():
     )
     
     # 设置时间相关特征
-    t = 0  # 中间时间步
+    t = 0.99  # 中间时间步
     rot_score_scaling, trans_score_scaling = diffuser.score_scaling(t)
     
     # 构造输入字典，包含所有必要特征
