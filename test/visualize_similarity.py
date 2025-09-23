@@ -10,9 +10,6 @@
 3. 相关性分析
 4. 相似度热图
 5. 综合分析报告
-
-作者: AI Assistant
-日期: 2025-09-22
 """
 
 import numpy as np

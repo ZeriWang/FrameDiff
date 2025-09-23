@@ -10,9 +10,6 @@ Features:
 3. Correlation analysis
 4. Similarity heatmaps
 5. Comprehensive analysis reports
-
-Author: AI Assistant
-Date: 2025-09-22
 """
 
 import numpy as np
