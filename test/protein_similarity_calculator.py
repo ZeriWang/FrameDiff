@@ -372,19 +372,23 @@ class ProteinSimilarityCalculator:
         print(f"   • 平移距离均值: {np.mean(cosine_trans_means):.6f} ± {np.std(cosine_trans_means):.6f}")
         print(f"   • 加权总距离均值: {np.mean(cosine_total_means):.6f} ± {np.std(cosine_total_means):.6f}")
         
-        # 时间演化趋势
-        print(f"\n⏱️ 时间演化趋势:")
+        # 时间演化趋势 (从t=1到t=0方向)
+        print(f"\n⏱️ 时间演化趋势 (从 t=1.0 到 t=0.0):")
         time_steps = results['time_steps']
         
-        print(f"   欧氏距离变化:")
-        print(f"     - 旋转: {euclidean_rot_means[0]:.6f} → {euclidean_rot_means[-1]:.6f}")
-        print(f"     - 平移: {euclidean_trans_means[0]:.6f} → {euclidean_trans_means[-1]:.6f}")
-        print(f"     - 总距离: {euclidean_total_means[0]:.6f} → {euclidean_total_means[-1]:.6f}")
+        # 找到最大和最小时间步对应的索引
+        max_time_idx = np.argmax(time_steps)
+        min_time_idx = np.argmin(time_steps)
         
-        print(f"   余弦距离变化:")
-        print(f"     - 旋转: {cosine_rot_means[0]:.6f} → {cosine_rot_means[-1]:.6f}")
-        print(f"     - 平移: {cosine_trans_means[0]:.6f} → {cosine_trans_means[-1]:.6f}")
-        print(f"     - 总距离: {cosine_total_means[0]:.6f} → {cosine_total_means[-1]:.6f}")
+        print(f"   欧氏距离变化 (t={time_steps[max_time_idx]:.3f} → t={time_steps[min_time_idx]:.3f}):")
+        print(f"     - 旋转: {euclidean_rot_means[max_time_idx]:.6f} → {euclidean_rot_means[min_time_idx]:.6f}")
+        print(f"     - 平移: {euclidean_trans_means[max_time_idx]:.6f} → {euclidean_trans_means[min_time_idx]:.6f}")
+        print(f"     - 总距离: {euclidean_total_means[max_time_idx]:.6f} → {euclidean_total_means[min_time_idx]:.6f}")
+        
+        print(f"   余弦距离变化 (t={time_steps[max_time_idx]:.3f} → t={time_steps[min_time_idx]:.3f}):")
+        print(f"     - 旋转: {cosine_rot_means[max_time_idx]:.6f} → {cosine_rot_means[min_time_idx]:.6f}")
+        print(f"     - 平移: {cosine_trans_means[max_time_idx]:.6f} → {cosine_trans_means[min_time_idx]:.6f}")
+        print(f"     - 总距离: {cosine_total_means[max_time_idx]:.6f} → {cosine_total_means[min_time_idx]:.6f}")
     
     def save_results(self, results, output_dir=None, rot_weight=0.5, trans_weight=0.5):
         """保存计算结果"""
