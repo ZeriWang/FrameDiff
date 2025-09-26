@@ -11,11 +11,11 @@ from openfold.data import data_transforms
 from openfold.utils import rigid_utils as ru
 
 # 输入参数
-PDB_PATH = '/home/zeriwang/lab/FrameDiff/test/pdb_dir/1AKE.pdb'
+PDB_PATH = 'Lab/FrameDiff/test/pdb_dir/1AKE.pdb'
 CHAIN_ID = 'A'  # 蛋白质链ID
-OUTPUT_DIR = '/home/zeriwang/lab/FrameDiff/test/output_dir_batch'
-WEIGHTS_PATH = '/home/zeriwang/lab/FrameDiff/weights/best_weights.pth'
-CONF_PATH = '/home/zeriwang/lab/FrameDiff/config/base.yaml'
+OUTPUT_DIR = 'Lab/FrameDiff/test/output_dir_batch'
+WEIGHTS_PATH = 'Lab/FrameDiff/weights/best_weights.pth'
+CONF_PATH = 'Lab/FrameDiff/config/base.yaml'
 
 # 批处理参数
 TIME_RANGE = (0.01, 0.99)  # 时间步范围
