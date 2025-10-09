@@ -15,7 +15,7 @@ from openfold.utils import rigid_utils as ru
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()  # FrameDiff目录
 
 # 输入参数 - 使用绝对路径
-PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '4AKE.pdb')
+PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1AKE.pdb')
 CHAIN_ID = 'A'  # 蛋白质链ID
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_batch')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
