@@ -46,10 +46,10 @@ WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 采样参数
-NUM_SAMPLES = 10           # 生成的样本数量（减少以加快测试）
-NUM_DIFFUSION_STEPS = 100  # 逆向扩散步数
+NUM_SAMPLES = 10           # 生成的样本数量
+NUM_DIFFUSION_STEPS = 500  # 逆向扩散步数
 MIN_T = 0.01              # 最小时间步
-NOISE_SCALE = 1.0         # 噪声缩放因子
+NOISE_SCALE = 0.1         # 噪声缩放因子
 
 
 def process_chain_feats(pdb_feats):
@@ -72,64 +72,58 @@ def process_chain_feats(pdb_feats):
 
 
 def rigids_to_protein(rigids_t, aatype, residue_index):
-    """将Rigids转换为Protein对象"""
-    if isinstance(aatype, torch.Tensor):
-        aatype = aatype.cpu().numpy()
-    if isinstance(residue_index, torch.Tensor):
-        residue_index = residue_index.cpu().numpy()
-    
-    # 从Rigids获取旋转和平移
-    if hasattr(rigids_t, 'get_rots') and hasattr(rigids_t, 'get_trans'):
-        rots = rigids_t.get_rots()
-        trans = rigids_t.get_trans()
-    elif isinstance(rigids_t, torch.Tensor):
-        if rigids_t.shape[-1] == 7:
-            rigids_obj = ru.Rigid.from_tensor_7(rigids_t)
-            rots = rigids_obj.get_rots()
-            trans = rigids_obj.get_trans()
-        else:
-            raise ValueError(f"Unexpected rigids_t tensor shape: {rigids_t.shape}")
-    else:
-        raise ValueError(f"Unexpected rigids_t type: {type(rigids_t)}")
-    
-    # 转换为numpy
-    if isinstance(rots, torch.Tensor):
-        rots = rots.cpu().numpy()
-    if isinstance(trans, torch.Tensor):
-        trans = trans.cpu().numpy()
-    
-    num_res = len(aatype)
-    
-    # 创建原子坐标
-    atom_positions = np.zeros((num_res, 37, 3))
-    atom_mask = np.zeros((num_res, 37))
-    
-    # CA, N, C原子
-    atom_positions[:, 1, :] = trans
-    atom_mask[:, 1] = 1.0
-    
-    n_ca_vec = np.array([-0.525, -0.763, 0.0])
-    c_ca_vec = np.array([0.525, -0.763, 0.0])
-    
-    for i in range(num_res):
-        n_pos = trans[i] + np.dot(rots[i], n_ca_vec)
-        c_pos = trans[i] + np.dot(rots[i], c_ca_vec)
-        atom_positions[i, 0, :] = n_pos
-        atom_positions[i, 2, :] = c_pos
-        atom_mask[i, 0] = 1.0
-        atom_mask[i, 2] = 1.0
-    
-    prot = protein.Protein(
-        atom_positions=atom_positions,
-        aatype=aatype,
-        atom_mask=atom_mask,
-        residue_index=residue_index,
-        b_factors=np.zeros((num_res, 37)),
-        chain_index=np.zeros(num_res, dtype=np.int32),
-    )
-    
-    return prot
+    """将SE(3)样本转换为Protein对象，复用官方骨架重建逻辑。"""
 
+    if isinstance(rigids_t, torch.Tensor):
+        if rigids_t.shape[-1] != 7:
+            raise ValueError(f"Unexpected rigids_t tensor shape: {rigids_t.shape}")
+        rigid_tensor = rigids_t
+    else:
+        rigid_tensor = rigids_t.to_tensor_7()
+
+    if rigid_tensor.ndim == 2:
+        rigid_tensor = rigid_tensor.unsqueeze(0)
+    elif rigid_tensor.ndim != 3:
+        raise ValueError(f"Unexpected rigid tensor shape: {rigid_tensor.shape}")
+
+    rigids_batch = ru.Rigid.from_tensor_7(rigid_tensor)
+    batch_size, num_res = rigid_tensor.shape[0], rigid_tensor.shape[1]
+
+    psi_torsions = rigid_tensor.new_zeros((batch_size, num_res, 2))
+    psi_torsions[..., 0] = 1.0
+
+    atom37_pos, atom37_mask, _, _ = all_atom.compute_backbone(
+        rigids_batch, psi_torsions
+    )
+
+    atom37_pos = atom37_pos[0]
+    atom37_mask = atom37_mask[0]
+
+    if isinstance(atom37_pos, torch.Tensor):
+        atom37_pos = atom37_pos.detach().cpu().numpy()
+    if isinstance(atom37_mask, torch.Tensor):
+        atom37_mask = atom37_mask.detach().cpu().numpy().astype(np.float32)
+
+    if isinstance(aatype, torch.Tensor):
+        aatype = aatype.detach().cpu().numpy()
+    if isinstance(residue_index, torch.Tensor):
+        residue_index = residue_index.detach().cpu().numpy()
+
+    if atom37_pos.shape[0] != len(aatype):
+        raise ValueError(
+            f"aatype length {len(aatype)} differs from atom positions {atom37_pos.shape[0]}"
+        )
+
+    b_factors = np.zeros_like(atom37_mask, dtype=np.float32)
+
+    return protein.Protein(
+        atom_positions=atom37_pos,
+        aatype=aatype,
+        atom_mask=atom37_mask,
+        residue_index=residue_index,
+        b_factors=b_factors,
+        chain_index=np.zeros(len(aatype), dtype=np.int32),
+    )
 
 def save_protein_to_pdb(prot, output_path):
     """保存PDB文件"""
