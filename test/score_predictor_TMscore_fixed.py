@@ -46,11 +46,11 @@ WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 采样参数
-NUM_SAMPLES = 10           # 生成的样本数量
-NUM_DIFFUSION_STEPS = 500  # 逆向扩散步数
+NUM_SAMPLES = 5           # 生成的样本数量
+NUM_DIFFUSION_STEPS = 1500  # 逆向扩散步数
 MIN_T = 0.01              # 最小时间步
-NOISE_SCALE = 0.1         # 噪声缩放因子
-START_T_RANGE = (0.1, 0.35)  # 初始时间步范围（越小表示加入的噪声越少）
+NOISE_SCALE = 0.05         # 噪声缩放因子
+START_T_RANGE = (0.01, 0.05)  # 初始时间步范围（越小表示加入的噪声越少）
 ENABLE_SELF_CONDITIONING = True  # 是否在采样时应用自条件
 USE_FORWARD_MARGINAL_INIT = True  # 是否通过前向扩散得到初始状态
 
