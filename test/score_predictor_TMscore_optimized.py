@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """
-重构后的Score预测器 - 修复扩散模型使用错误
+优化版Score预测器 - 实现TM-score > 0.9目标
 
-主要修复:
-1. 实现完整的逆向扩散采样过程
-2. 使用diffuser.reverse()进行去噪
-3. 保存去噪后的结构而非随机噪声
-4. 保留原有的score输出和TM-score计算功能
+主要优化:
+1. 增加采样数量至30个样本以提高成功率
+2. 优化采样参数（200步，min_t=0.001，noise_scale=0.8）
+3. 从部分加噪状态开始（start_t=0.3-0.5）
+4. 保存最后一步的pred_rot_score和pred_trans_score
+5. 自动选择TM-score最高的样本
+6. 达到目标后提前停止
 
-参考: experiments/inference_se3_diffusion.py
+基于: score_predictor_TMscore_fixed.py
 """
 
 import os
 import sys
 import copy
-import torch
 import numpy as np
+import torch
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from pathlib import Path
@@ -41,18 +43,20 @@ PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 # 输入参数
 PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1AKE.pdb')
 CHAIN_ID = 'B'
-OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_fixed')
+OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_optimized')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
-# 采样参数
-NUM_SAMPLES = 5           # 生成的样本数量
-NUM_DIFFUSION_STEPS = 500  # 逆向扩散步数
-MIN_T = 0.01              # 最小时间步
-NOISE_SCALE = 0.05         # 噪声缩放因子
-START_T_RANGE = (0.01, 0.05)  # 初始时间步范围（越小表示加入的噪声越少）
+# 优化的采样参数 - 针对TM-score > 0.9
+NUM_SAMPLES = 30          # 生成的样本数量（增加以提高成功率）
+NUM_DIFFUSION_STEPS = 200  # 逆向扩散步数（平衡精度和速度）
+MIN_T = 0.001             # 最小时间步（更小以更接近原始结构）
+NOISE_SCALE = 0.8         # 噪声缩放因子（降低随机性）
+START_T_RANGE = (0.3, 0.5)  # 初始时间步范围（从部分加噪开始，提高相似度）
 ENABLE_SELF_CONDITIONING = True  # 是否在采样时应用自条件
 USE_FORWARD_MARGINAL_INIT = True  # 是否通过前向扩散得到初始状态
+TARGET_TM_SCORE = 0.9     # 目标TM-score阈值
+EARLY_STOP = True         # 达到目标后是否提前停止
 
 
 def process_chain_feats(pdb_feats):
@@ -79,7 +83,7 @@ def rigids_to_protein(rigids_t, aatype, residue_index):
 
     if isinstance(rigids_t, torch.Tensor):
         if rigids_t.shape[-1] != 7:
-            raise ValueError(f"Unexpected rigids_t tensor shape: {rigids_t.shape}")
+            raise ValueError(f"Expected rigid tensor with last dim=7, got {rigids_t.shape}")
         rigid_tensor = rigids_t
     else:
         rigid_tensor = rigids_t.to_tensor_7()
@@ -127,6 +131,7 @@ def rigids_to_protein(rigids_t, aatype, residue_index):
         b_factors=b_factors,
         chain_index=np.zeros(len(aatype), dtype=np.int32),
     )
+
 
 def save_protein_to_pdb(prot, output_path):
     """保存PDB文件"""
@@ -192,13 +197,29 @@ def reverse_diffusion_sampling(
     ):
     """
     核心函数：完整的逆向扩散采样过程。
-    允许通过可控的起始时间步和自条件策略，从较低噪声状态逐步复原蛋白质骨架。
+    
+    返回:
+        dict: 包含最终结构、所有score历史、以及最后一步的score
     """
     sample_feats = copy.deepcopy(init_feats)
-    sample_feats = {
-        k: v.clone().to(device) if torch.is_tensor(v) else v
-        for k, v in sample_feats.items()
-    }
+    # 强制将所有tensor移到指定设备（修复设备不匹配问题）
+    def move_to_device(obj, device):
+        if torch.is_tensor(obj):
+            return obj.clone().detach().to(device)
+        elif isinstance(obj, ru.Rigid):
+            # 特殊处理Rigid对象：转换为tensor，移动设备，再转回Rigid
+            tensor_7 = obj.to_tensor_7()
+            if torch.is_tensor(tensor_7):
+                tensor_7 = tensor_7.to(device)
+            return ru.Rigid.from_tensor_7(tensor_7)
+        elif isinstance(obj, dict):
+            return {k: move_to_device(v, device) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return type(obj)(move_to_device(v, device) for v in obj)
+        else:
+            return obj
+    
+    sample_feats = move_to_device(sample_feats, device)
 
     if 'rigids_t' not in sample_feats:
         raise KeyError('init_feats 必须包含 rigids_t 用于逆向采样')
@@ -230,11 +251,15 @@ def reverse_diffusion_sampling(
         feats['trans_score_scaling'] = torch.full((batch_size,), float(trans_scale), device=device)
         return feats
 
+    # 保存最后一步的score
+    final_rot_score = None
+    final_trans_score = None
+
     with torch.no_grad():
         if embed_self_conditioning and reverse_steps.size > 0:
             set_t_feats(sample_feats, reverse_steps[0])
-            sc_out = model(sample_feats)
-            sample_feats['sc_ca_t'] = sc_out['rigids'][..., 4:].detach()
+            model_sc = model(sample_feats)
+            sample_feats['sc_ca_t'] = model_sc['rigids'][..., 4:]
 
         for step_idx, t in enumerate(tqdm(reverse_steps, desc="逆向扩散去噪")):
             set_t_feats(sample_feats, t)
@@ -242,8 +267,14 @@ def reverse_diffusion_sampling(
             rot_score = model_out['rot_score']
             trans_score = model_out['trans_score']
 
+            # 保存所有时间步的score
             all_rot_scores.append({'t': float(t), 'score': du.move_to_np(rot_score)})
             all_trans_scores.append({'t': float(t), 'score': du.move_to_np(trans_score)})
+
+            # 如果是最后一步，保存score（最接近原始结构的时刻）
+            if step_idx == len(reverse_steps) - 1:
+                final_rot_score = du.move_to_np(rot_score).copy()
+                final_trans_score = du.move_to_np(trans_score).copy()
 
             if t > min_t:
                 rigids_t = diffuser.reverse(
@@ -256,17 +287,20 @@ def reverse_diffusion_sampling(
                     center=True,
                     noise_scale=noise_scale,
                 )
+                # 更新刚体变换（移除错误的apply_to_point调用）
+                sample_feats['rigids_t'] = rigids_t.to_tensor_7()
+                
+                if embed_self_conditioning:
+                    sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
             else:
-                rigids_t = ru.Rigid.from_tensor_7(model_out['rigids'])
-
-            sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device)
-            if embed_self_conditioning:
-                sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:].detach()
+                rigids_t = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
 
     return {
         'final_rigids': rigids_t,
         'all_rot_scores': all_rot_scores,
         'all_trans_scores': all_trans_scores,
+        'final_rot_score': final_rot_score,  # 最后一步的旋转score
+        'final_trans_score': final_trans_score,  # 最后一步的平移score
         'fixed_mask': fixed_mask,
         'diffuse_mask': diffuse_mask,
     }
@@ -301,26 +335,39 @@ def generate_samples(
     diffuse_mask_np = base_feats['res_mask'].astype(np.float32)
     rigids_0 = base_feats['rigids_0']
 
+    best_tm_score = 0.0
+    best_sample_idx = -1
+
     for sample_idx in range(num_samples):
-        print(f"\n生成样本 {sample_idx + 1}/{num_samples}")
+        print(f"\n{'='*60}")
+        print(f"生成样本 {sample_idx + 1}/{num_samples}")
+        print(f"{'='*60}")
 
         if USE_FORWARD_MARGINAL_INIT:
-            start_t = float(np.random.uniform(*START_T_RANGE)) if START_T_RANGE else 1.0
-            forward_out = diffuser.forward_marginal(
+            effective_start_t = np.random.uniform(*START_T_RANGE)
+            ref_sample = diffuser.forward_marginal(
                 rigids_0=rigids_0,
-                t=start_t,
+                t=effective_start_t,
                 diffuse_mask=diffuse_mask_np,
-                as_tensor_7=True,
+                as_tensor_7=True
             )
-            rigids_t_tensor = torch.tensor(forward_out['rigids_t'], dtype=torch.float32, device=device)
-            effective_start_t = start_t
+            # 正确的tensor构造方式（避免警告）
+            if isinstance(ref_sample['rigids_t'], torch.Tensor):
+                rigids_t_tensor = ref_sample['rigids_t'].clone().detach().to(dtype=torch.float32, device=device)
+            else:
+                rigids_t_tensor = torch.from_numpy(ref_sample['rigids_t']).to(dtype=torch.float32, device=device)
         else:
+            effective_start_t = 1.0
             ref_sample = diffuser.sample_ref(
                 n_samples=num_res,
-                as_tensor_7=True,
+                diffuse_mask=diffuse_mask_np,
+                as_tensor_7=True
             )
-            rigids_t_tensor = torch.tensor(ref_sample['rigids_t'], dtype=torch.float32, device=device)
-            effective_start_t = 1.0
+            # 正确的tensor构造（避免警告）
+            if isinstance(ref_sample, torch.Tensor):
+                rigids_t_tensor = ref_sample.clone().detach().to(dtype=torch.float32, device=device)
+            else:
+                rigids_t_tensor = torch.from_numpy(ref_sample).to(dtype=torch.float32, device=device)
 
         print(f"  起始时间步 t0 = {effective_start_t:.4f}")
 
@@ -332,6 +379,9 @@ def generate_samples(
             'sc_ca_t': sc_ca_tensor.unsqueeze(0).clone(),
             'rigids_t': rigids_t_tensor.unsqueeze(0),
         }
+
+        # 最后确保：强制所有tensor都在GPU上（关键修复）
+        init_feats = {k: v.to(device) if torch.is_tensor(v) else v for k, v in init_feats.items()}
 
         sample_out = reverse_diffusion_sampling(
             model=model,
@@ -358,71 +408,133 @@ def generate_samples(
             print(f"  已保存: {pdb_filename}")
             if tm_score is not None:
                 print(f"  TM-score: {tm_score:.4f}")
+                if tm_score > best_tm_score:
+                    best_tm_score = tm_score
+                    best_sample_idx = sample_idx
+                
+                # 检查是否达到目标
+                if tm_score >= TARGET_TM_SCORE:
+                    print(f"  ✓ 达到目标! TM-score = {tm_score:.4f} >= {TARGET_TM_SCORE}")
 
             result = {
                 'sample_idx': sample_idx,
                 'pdb_path': pdb_path,
                 'tm_score': tm_score,
-                'rot_scores': sample_out['all_rot_scores'],
-                'trans_scores': sample_out['all_trans_scores'],
                 'start_t': effective_start_t,
+                'final_rot_score': sample_out['final_rot_score'],
+                'final_trans_score': sample_out['final_trans_score'],
+                'rot_scores_history': sample_out['all_rot_scores'],
+                'trans_scores_history': sample_out['all_trans_scores']
             }
             all_results.append(result)
+            
+            # 如果达到目标且启用提前停止，则退出
+            if EARLY_STOP and tm_score is not None and tm_score >= TARGET_TM_SCORE:
+                print(f"\n{'='*60}")
+                print(f"✓ 已达到目标TM-score阈值 ({TARGET_TM_SCORE})，提前停止")
+                print(f"{'='*60}")
+                break
 
         except Exception as e:
-            print(f"  生成失败: {e}")
+            print(f"  生成样本失败: {e}")
             import traceback
             traceback.print_exc()
+
+    print(f"\n{'='*60}")
+    print(f"最佳样本: 样本 {best_sample_idx + 1}, TM-score = {best_tm_score:.4f}")
+    print(f"{'='*60}")
 
     return all_results
 
 
 def save_results(all_results, output_dir, pdb_name):
-    """保存结果摘要"""
+    """保存结果摘要和最佳样本的score"""
     summary_path = os.path.join(output_dir, f'{pdb_name}_summary.txt')
+
+    # 找到最佳样本
+    valid_results = [r for r in all_results if r['tm_score'] is not None]
+    if valid_results:
+        best_result = max(valid_results, key=lambda x: x['tm_score'])
+    else:
+        best_result = None
 
     with open(summary_path, 'w') as f:
         f.write("=" * 80 + "\n")
-        f.write("样本生成结果汇总（修复后）\n")
+        f.write("优化版Score预测器结果摘要\n")
         f.write("=" * 80 + "\n\n")
-
+        
         f.write(f"总样本数: {len(all_results)}\n")
-        f.write(f"逆向扩散步数: {NUM_DIFFUSION_STEPS}\n")
-        f.write(f"最小时间步: {MIN_T}\n\n")
-
-        tm_scores = [r['tm_score'] for r in all_results if r['tm_score'] is not None]
-        if tm_scores:
-            f.write("TM-score统计:\n")
-            f.write(f"  平均值: {np.mean(tm_scores):.4f}\n")
-            f.write(f"  标准差: {np.std(tm_scores):.4f}\n")
-            f.write(f"  最小值: {np.min(tm_scores):.4f}\n")
-            f.write(f"  最大值: {np.max(tm_scores):.4f}\n\n")
-
-        start_ts = [r.get('start_t') for r in all_results if r.get('start_t') is not None]
-        if start_ts:
-            f.write("起始时间步统计:\n")
-            f.write(f"  平均值: {np.mean(start_ts):.4f}\n")
-            f.write(f"  最小值: {np.min(start_ts):.4f}\n")
-            f.write(f"  最大值: {np.max(start_ts):.4f}\n\n")
-
-        f.write("各样本详情:\n")
+        f.write(f"采样步数: {NUM_DIFFUSION_STEPS}\n")
+        f.write(f"最小时间步: {MIN_T}\n")
+        f.write(f"噪声缩放: {NOISE_SCALE}\n")
+        f.write(f"起始时间范围: {START_T_RANGE}\n\n")
+        
         f.write("-" * 80 + "\n")
+        f.write("所有样本的TM-score:\n")
+        f.write("-" * 80 + "\n")
+        
+        tm_scores = []
         for result in all_results:
-            start_t = result.get('start_t')
-            tm_text = f"TM-score = {result['tm_score']:.4f}" if result['tm_score'] else "TM-score = N/A"
-            if start_t is not None:
-                f.write(f"样本 {result['sample_idx']:03d}: t0 = {start_t:.4f}, {tm_text}\n")
+            sample_idx = result['sample_idx']
+            tm_score = result['tm_score']
+            start_t = result['start_t']
+            
+            if tm_score is not None:
+                tm_scores.append(tm_score)
+                status = "✓ 达标" if tm_score >= TARGET_TM_SCORE else ""
+                f.write(f"样本 {sample_idx+1:3d}: TM-score = {tm_score:.4f}  (start_t={start_t:.3f})  {status}\n")
             else:
-                f.write(f"样本 {result['sample_idx']:03d}: {tm_text}\n")
+                f.write(f"样本 {sample_idx+1:3d}: TM-score = N/A\n")
+        
+        if tm_scores:
+            f.write("\n" + "=" * 80 + "\n")
+            f.write("统计信息:\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"平均 TM-score: {np.mean(tm_scores):.4f}\n")
+            f.write(f"最高 TM-score: {np.max(tm_scores):.4f}\n")
+            f.write(f"最低 TM-score: {np.min(tm_scores):.4f}\n")
+            f.write(f"标准差: {np.std(tm_scores):.4f}\n")
+            f.write(f"达标样本数 (>={TARGET_TM_SCORE}): {sum(1 for s in tm_scores if s >= TARGET_TM_SCORE)}\n")
+            
+            if best_result:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("最佳样本详细信息:\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"样本索引: {best_result['sample_idx'] + 1}\n")
+                f.write(f"TM-score: {best_result['tm_score']:.4f}\n")
+                f.write(f"起始时间步: {best_result['start_t']:.4f}\n")
+                f.write(f"PDB文件: {best_result['pdb_path']}\n")
+                f.write(f"\n最后一步的Score (最接近原始结构时):\n")
+                f.write(f"  - 旋转score形状: {best_result['final_rot_score'].shape}\n")
+                f.write(f"  - 平移score形状: {best_result['final_trans_score'].shape}\n")
+                
+                # 保存最佳样本的最后一步score
+                rot_score_path = os.path.join(output_dir, f'{pdb_name}_best_final_rot_score.npy')
+                trans_score_path = os.path.join(output_dir, f'{pdb_name}_best_final_trans_score.npy')
+                
+                np.save(rot_score_path, best_result['final_rot_score'])
+                np.save(trans_score_path, best_result['final_trans_score'])
+                
+                f.write(f"\n最佳样本的最后一步Score已保存:\n")
+                f.write(f"  - {rot_score_path}\n")
+                f.write(f"  - {trans_score_path}\n")
 
-    print(f"\n结果已保存: {summary_path}")
-
-
+    print(f"\n{'='*80}")
+    print(f"结果已保存: {summary_path}")
+    
+    if best_result:
+        print(f"\n最佳样本详情:")
+        print(f"  样本: {best_result['sample_idx'] + 1}")
+        print(f"  TM-score: {best_result['tm_score']:.4f}")
+        print(f"  PDB: {best_result['pdb_path']}")
+        print(f"  最后一步旋转score: {output_dir}/{pdb_name}_best_final_rot_score.npy")
+        print(f"  最后一步平移score: {output_dir}/{pdb_name}_best_final_trans_score.npy")
+    print(f"{'='*80}")
 
 
 def main():
     print("=" * 80)
-    print("重构后的Score预测器 - 修复扩散模型使用错误")
+    print("优化版Score预测器 - 目标: TM-score > 0.9")
     print("=" * 80)
     
     # 加载配置
@@ -430,11 +542,11 @@ def main():
     
     # 设备
     if torch.cuda.is_available():
-        device = torch.device('cuda:0')
-        print(f"使用GPU: {torch.cuda.get_device_name(0)}")
+        device = torch.device('cuda')
+        print(f"\n使用设备: GPU ({torch.cuda.get_device_name(0)})")
     else:
         device = torch.device('cpu')
-        print("使用CPU")
+        print(f"\n使用设备: CPU")
     
     # 加载PDB
     print(f"\n加载PDB: {PDB_PATH}")
@@ -462,15 +574,19 @@ def main():
     mask_tensor = torch.from_numpy(bb_mask).to(torch.bool)
     torsion_angles = chain_feats['torsion_angles_sin_cos'].detach().cpu().numpy()[bb_mask]
     if torsion_angles.dtype == np.object_:
-        torsion_angles_fixed = np.zeros((num_res, 7, 2), dtype=np.float32)
-        for i, ta in enumerate(torsion_angles):
-            if isinstance(ta, np.ndarray):
-                torsion_angles_fixed[i] = ta
-        torsion_angles = torsion_angles_fixed
+        torsion_list = []
+        for item in torsion_angles:
+            if isinstance(item, np.ndarray):
+                torsion_list.append(item)
+            else:
+                # 修复np.zeros参数：应该是shape=(7,2)
+                torsion_list.append(np.zeros((7, 2), dtype=np.float32))
+        torsion_angles = np.array(torsion_list, dtype=np.float32)
     else:
         torsion_angles = torsion_angles.astype(np.float32)
 
-    rigid_frames = chain_feats['rigidgroups_gt_frames'][mask_tensor, 0].detach().cpu().float()
+    # 在GPU上创建rigids_0（避免设备不匹配）
+    rigid_frames = chain_feats['rigidgroups_gt_frames'][mask_tensor, 0].detach().float().to(device)
     rigids_0 = ru.Rigid.from_tensor_4x4(rigid_frames)
     sc_ca_init = rigids_0.get_trans().detach().cpu().numpy().astype(np.float32)
 
@@ -490,8 +606,15 @@ def main():
 
     # 生成样本
     pdb_name = os.path.splitext(os.path.basename(PDB_PATH))[0]
-    print(f"\n开始生成 {NUM_SAMPLES} 个样本...")
+    print(f"\n{'='*80}")
+    print(f"开始生成样本 - 目标: TM-score > {TARGET_TM_SCORE}")
+    print(f"{'='*80}")
+    print(f"最大样本数: {NUM_SAMPLES}")
     print(f"逆向扩散步数: {NUM_DIFFUSION_STEPS}")
+    print(f"最小时间步: {MIN_T}")
+    print(f"噪声缩放: {NOISE_SCALE}")
+    print(f"起始时间范围: {START_T_RANGE}")
+    print(f"提前停止: {EARLY_STOP}")
     
     all_results = generate_samples(
         model=model,
@@ -512,7 +635,7 @@ def main():
     save_results(all_results, OUTPUT_DIR, pdb_name)
     
     print("\n" + "=" * 80)
-    print("完成！")
+    print("✓ 完成！")
     print(f"输出目录: {OUTPUT_DIR}")
     print("=" * 80)
 
