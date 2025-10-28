@@ -1,0 +1,19 @@
+直接去噪结果摘要
+============================================================
+
+输入PDB: /home/zeriwang/lab/FrameDiff/test/pdb_dir/1AKE.pdb
+链ID: B
+残基数: 214
+去噪步数: 500
+时间范围: 0.01 -> 0.05
+噪声缩放: 0.1
+
+结果:
+  去噪后PDB: /home/zeriwang/lab/FrameDiff/test/output_dir_direct_denoising/1AKE_denoised.pdb
+  TM-score: 0.4973
+
+最终Score信息:
+  旋转Score shape: (1, 214, 3)
+  平移Score shape: (1, 214, 3)
+  旋转Score统计: mean=0.174316, std=2.091809
+  平移Score统计: mean=-0.311024, std=4.843053
