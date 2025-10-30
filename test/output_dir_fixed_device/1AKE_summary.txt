@@ -3,22 +3,26 @@ Score预测器结果摘要 - 修复设备不匹配版本
 
 输入PDB: /home/zeriwang/lab/FrameDiff/test/pdb_dir/1AKE.pdb
 链ID: B
-生成样本数: 1
+生成样本数: 5
 目标TM-score: 0.9
 
 最佳结果:
   样本ID: 1
-  TM-score: 1.0000
-  起始时间: 0.0272
+  TM-score: 0.4970
+  起始时间: 0.0134
   样本文件: /home/zeriwang/lab/FrameDiff/test/output_dir_fixed_device/1AKE_samples/sample_001.pdb
 
 最佳样本的最终Score信息:
   旋转Score shape: (1, 214, 3)
   平移Score shape: (1, 214, 3)
-  旋转Score统计: mean=0.328323, std=4.393194
-  平移Score统计: mean=-0.193726, std=8.309421
+  旋转Score统计: mean=0.108369, std=7.849020
+  平移Score统计: mean=-5.888600, std=76.834808
 
 所有样本结果:
 ID   TM-score   起始时间       文件路径                                              
 --------------------------------------------------------------------------------
-1    1.0000     0.0272     sample_001.pdb                                    
+1    0.4970     0.0134     sample_001.pdb                                    
+2    0.4966     0.0152     sample_002.pdb                                    
+3    0.4967     0.0210     sample_003.pdb                                    
+4    0.4958     0.0180     sample_004.pdb                                    
+5    0.4965     0.0163     sample_005.pdb                                    

@@ -46,11 +46,11 @@ WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 激进优化的采样参数 - 针对TM-score > 0.9
-NUM_SAMPLES = 10          # 增加生成的样本数量以提高成功率
-NUM_DIFFUSION_STEPS = 500  # 增加逆向扩散步数以提高精度
-MIN_T = 0.0001            # 更小的最小时间步以更接近原始结构
+NUM_SAMPLES = 5          # 增加生成的样本数量以提高成功率
+NUM_DIFFUSION_STEPS = 300  # 增加逆向扩散步数以提高精度
+MIN_T = 0.001            # 更小的最小时间步以更接近原始结构
 NOISE_SCALE = 0.3         # 大幅降低噪声缩放因子
-START_T_RANGE = (0.01, 0.05)  # 从很小的噪声开始，几乎从原始结构开始
+START_T_RANGE = (0.01, 0.03)  # 从很小的噪声开始，几乎从原始结构开始
 ENABLE_SELF_CONDITIONING = True  # 保持自条件
 USE_FORWARD_MARGINAL_INIT = True  # 通过前向扩散得到初始状态
 TARGET_TM_SCORE = 0.9     # 目标TM-score阈值
