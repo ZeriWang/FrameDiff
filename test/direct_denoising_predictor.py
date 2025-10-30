@@ -46,10 +46,10 @@ WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 直接去噪参数
-NUM_DENOISING_STEPS = 500    # 去噪步数
-MIN_T = 0.01                 # 最小时间步
-MAX_T = 0.05                 # 最大时间步（从很小的噪声开始）
-NOISE_SCALE = 0.1            # 极小的噪声缩放因子
+NUM_DENOISING_STEPS = 100    # 去噪步数
+MIN_T = 0.0001                 # 最小时间步
+MAX_T = 0.0003                 # 最大时间步（从很小的噪声开始）
+NOISE_SCALE = 0.00001            # 极小的噪声缩放因子
 ENABLE_SELF_CONDITIONING = True  # 启用自条件
 SAVE_SCORES = True           # 保存最终分数
 
@@ -132,8 +132,16 @@ def save_protein_to_pdb(prot, output_path):
         f.write(pdb_string)
 
 
-def calculate_tm_score(pdb_path1, pdb_path2):
-    """计算TM-score"""
+def calculate_tm_score(pdb_path1, pdb_path2, chain_id1=None, chain_id2=None):
+    """
+    计算TM-score，支持指定链ID。
+    
+    Args:
+        pdb_path1: 参考PDB路径 (原始结构)
+        pdb_path2: 查询PDB路径 (去噪后结构)
+        chain_id1: 参考PDB中要读取的链ID (如 'B')
+        chain_id2: 查询PDB中要读取的链ID (如果不指定，默认读取第一条链)
+    """
     if not TMTOOLS_AVAILABLE:
         return None
     
@@ -142,27 +150,40 @@ def calculate_tm_score(pdb_path1, pdb_path2):
         structure1 = parser.get_structure('ref', pdb_path1)
         structure2 = parser.get_structure('query', pdb_path2)
         
-        coords1 = []
-        seq1 = []
-        for model in structure1:
+        def get_coords_and_seq(structure, target_chain_id=None):
+            coords = []
+            seq = []
+            # 只读取第一个模型
+            model = next(iter(structure))
+            
             for chain in model:
+                # 如果指定了链ID，进行过滤
+                if target_chain_id is not None and chain.get_id() != target_chain_id:
+                    continue
+                
                 for residue in chain:
+                    # 过滤掉非标准残基(HETATM)
+                    if residue.id[0] != ' ':
+                        continue
                     if 'CA' in residue:
-                        coords1.append(residue['CA'].get_coord())
-                        seq1.append(residue.get_resname())
+                        coords.append(residue['CA'].get_coord())
+                        seq.append(residue.get_resname())
+                
+                # 如果找到了目标链，读取完就退出循环，避免读取多条链
+                if target_chain_id is not None and chain.get_id() == target_chain_id:
+                    break
+            return np.array(coords, dtype=np.float64), seq
+
+        # 提取坐标和序列
+        # 原始结构：必须指定链ID (如 'B')
+        coords1, seq1 = get_coords_and_seq(structure1, chain_id1)
+        # 去噪后结构：通常只有一条链，可以不指定，或者指定为默认的 'A'
+        coords2, seq2 = get_coords_and_seq(structure2, chain_id2)
         
-        coords2 = []
-        seq2 = []
-        for model in structure2:
-            for chain in model:
-                for residue in chain:
-                    if 'CA' in residue:
-                        coords2.append(residue['CA'].get_coord())
-                        seq2.append(residue.get_resname())
-        
-        coords1 = np.array(coords1, dtype=np.float64)
-        coords2 = np.array(coords2, dtype=np.float64)
-        
+        if len(coords1) == 0 or len(coords2) == 0:
+            print(f"警告: 未能在指定链中找到CA原子 (Chain1: {chain_id1}, Chain2: {chain_id2})")
+            return None
+
         from data.residue_constants import restype_3to1
         seq1_str = ''.join([restype_3to1.get(res, 'X') for res in seq1])
         seq2_str = ''.join([restype_3to1.get(res, 'X') for res in seq2])
@@ -172,6 +193,8 @@ def calculate_tm_score(pdb_path1, pdb_path2):
         
     except Exception as e:
         print(f"计算TM-score失败: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -429,7 +452,7 @@ def main():
         
         # 计算TM-score
         print("\n计算TM-score...")
-        tm_score = calculate_tm_score(PDB_PATH, output_pdb)
+        tm_score = calculate_tm_score(PDB_PATH, output_pdb, chain_id1=CHAIN_ID, chain_id2=None)
         if tm_score is not None:
             print(f"TM-score (去噪后 vs 原始): {tm_score:.4f}")
         else:

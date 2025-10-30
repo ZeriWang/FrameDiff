@@ -3,54 +3,22 @@
 ================================================================================
 
 PDB文件: 1AKE
-加噪时间步 t: 1e-05
-生成样本数: 3
+加噪时间步 t: 0.5
+生成样本数: 1
 
 
 ================================================================================
 样本 1
 ================================================================================
-  TM-score: 0.5000
-  加噪后PDB: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.000_noised.pdb
-  旋转score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.000_rot_score.npy
-  平移score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.000_trans_score.npy
+  TM-score: 0.1285
+  加噪后PDB: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.500_noised.pdb
+  旋转score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.500_rot_score.npy
+  平移score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_000_t_0.500_trans_score.npy
 
   Ground Truth Scores统计:
-    旋转score范围: [-29.0781, 29.6392]
-    旋转score均值: 0.0581
-    旋转score标准差: 9.6760
-    平移score范围: [-3447.3048, 3359.1277]
-    平移score均值: -85.3162
-    平移score标准差: 1051.3521
-
-================================================================================
-样本 2
-================================================================================
-  TM-score: 0.5000
-  加噪后PDB: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_001_t_0.000_noised.pdb
-  旋转score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_001_t_0.000_rot_score.npy
-  平移score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_001_t_0.000_trans_score.npy
-
-  Ground Truth Scores统计:
-    旋转score范围: [-28.5382, 26.3803]
-    旋转score均值: -0.1648
-    旋转score标准差: 9.5793
-    平移score范围: [-3774.2700, 3111.8874]
-    平移score均值: 1.1978
-    平移score标准差: 1006.7565
-
-================================================================================
-样本 3
-================================================================================
-  TM-score: 0.5000
-  加噪后PDB: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_002_t_0.000_noised.pdb
-  旋转score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_002_t_0.000_rot_score.npy
-  平移score文件: /home/zeriwang/lab/FrameDiff/test/test_forward_noise/1AKE_sample_002_t_0.000_trans_score.npy
-
-  Ground Truth Scores统计:
-    旋转score范围: [-35.2234, 37.4858]
-    旋转score均值: -0.2253
-    旋转score标准差: 10.2838
-    平移score范围: [-2980.7456, 2916.9072]
-    平移score均值: 26.3611
-    平移score标准差: 961.6952
+    旋转score范围: [-1.9417, 1.8992]
+    旋转score均值: -0.0301
+    旋转score标准差: 0.7819
+    平移score范围: [-3.0898, 3.1392]
+    平移score均值: -0.0454
+    平移score标准差: 1.0722
