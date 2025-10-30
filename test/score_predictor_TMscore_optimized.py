@@ -47,10 +47,10 @@ CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 激进优化的采样参数 - 针对TM-score > 0.9
 NUM_SAMPLES = 5          # 增加生成的样本数量以提高成功率
-NUM_DIFFUSION_STEPS = 300  # 增加逆向扩散步数以提高精度
+NUM_DIFFUSION_STEPS = 100  # 增加逆向扩散步数以提高精度
 MIN_T = 0.001            # 更小的最小时间步以更接近原始结构
-NOISE_SCALE = 0.3         # 大幅降低噪声缩放因子
-START_T_RANGE = (0.01, 0.03)  # 从很小的噪声开始，几乎从原始结构开始
+NOISE_SCALE = 0.01         # 大幅降低噪声缩放因子
+START_T_RANGE = (0.001, 0.003)  # 从很小的噪声开始，几乎从原始结构开始
 ENABLE_SELF_CONDITIONING = True  # 保持自条件
 USE_FORWARD_MARGINAL_INIT = True  # 通过前向扩散得到初始状态
 TARGET_TM_SCORE = 0.9     # 目标TM-score阈值
@@ -137,36 +137,58 @@ def save_protein_to_pdb(prot, output_path):
         f.write(pdb_string)
 
 
-def calculate_tm_score(pdb_path1, pdb_path2):
-    """计算TM-score"""
+def calculate_tm_score(pdb_path1, pdb_path2, chain_id1=None, chain_id2=None):
+    """
+    计算TM-score，支持指定链ID。
+    
+    Args:
+        pdb_path1: 参考PDB路径 (原始结构)
+        pdb_path2: 查询PDB路径 (生成的结构)
+        chain_id1: 参考PDB中要读取的链ID (如 'B')
+        chain_id2: 查询PDB中要读取的链ID (如果不指定，默认读取第一条链)
+    
+    Returns:
+        float: TM-score值，如果失败则返回None
+    """
     if not TMTOOLS_AVAILABLE:
         return None
     
     try:
         parser = PDBParser(QUIET=True)
-        structure1 = parser.get_structure('target', pdb_path1)
-        structure2 = parser.get_structure('pred', pdb_path2)
+        structure1 = parser.get_structure('ref', pdb_path1)
+        structure2 = parser.get_structure('query', pdb_path2)
         
-        coords1 = []
-        seq1 = []
-        for model in structure1:
+        def get_coords_and_seq(structure, target_chain_id=None):
+            coords = []
+            seq = []
+            # 只读取第一个模型
+            model = next(iter(structure))
+            
             for chain in model:
+                # 如果指定了链ID，只处理该链；否则处理所有链
+                if target_chain_id is not None and chain.id != target_chain_id:
+                    continue
+                    
                 for residue in chain:
-                    if 'CA' in residue:
-                        coords1.append(residue['CA'].get_coord())
-                        seq1.append(residue.get_resname())
+                    if residue.has_id('CA'):
+                        coords.append(residue['CA'].get_coord())
+                        seq.append(residue.get_resname())
+                
+                # 如果指定了链ID，找到后就退出
+                if target_chain_id is not None:
+                    break
+            
+            return np.array(coords, dtype=np.float64), seq
         
-        coords2 = []
-        seq2 = []
-        for model in structure2:
-            for chain in model:
-                for residue in chain:
-                    if 'CA' in residue:
-                        coords2.append(residue['CA'].get_coord())
-                        seq2.append(residue.get_resname())
+        # 提取坐标和序列
+        # 原始结构：必须指定链ID (如 'B')
+        coords1, seq1 = get_coords_and_seq(structure1, chain_id1)
+        # 生成后结构：通常只有一条链，可以不指定，或者指定为默认的 'A'
+        coords2, seq2 = get_coords_and_seq(structure2, chain_id2)
         
-        coords1 = np.array(coords1, dtype=np.float64)
-        coords2 = np.array(coords2, dtype=np.float64)
+        if len(coords1) == 0 or len(coords2) == 0:
+            print(f"警告: 未能在指定链中找到CA原子 (Chain1: {chain_id1}, Chain2: {chain_id2})")
+            return None
         
         from data.residue_constants import restype_3to1
         seq1_str = ''.join([restype_3to1.get(res, 'X') for res in seq1])
@@ -177,6 +199,8 @@ def calculate_tm_score(pdb_path1, pdb_path2):
         
     except Exception as e:
         print(f"计算TM-score失败: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -433,7 +457,7 @@ def generate_samples(
             print(f"  已保存: {sample_pdb}")
             
             # 计算TM-score
-            tm_score = calculate_tm_score(reference_pdb, sample_pdb)
+            tm_score = calculate_tm_score(reference_pdb, sample_pdb, chain_id1=CHAIN_ID, chain_id2=None)
             if tm_score is not None:
                 print(f"  TM-score: {tm_score:.4f}")
                 

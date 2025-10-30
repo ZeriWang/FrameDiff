@@ -47,8 +47,8 @@ OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'test_forward_noise')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 前向加噪参数
-NOISE_TIME_T = 0.00001       # 加噪的时间步 t ∈ [0, 1]，越大噪声越强
-NUM_NOISE_SAMPLES = 3     # 生成的加噪样本数量（可以生成多个）
+NOISE_TIME_T = 0.01       # 加噪的时间步 t ∈ [0, 1]，越大噪声越强
+NUM_NOISE_SAMPLES = 1     # 生成的加噪样本数量（可以生成多个）
 SAVE_SCORES = True        # 保存ground truth scores为npy格式
 
 
@@ -132,43 +132,62 @@ def save_protein_to_pdb(prot, output_path):
     print(f"已保存PDB文件: {output_path}")
 
 
-def calculate_tm_score(pdb_path1, pdb_path2):
-    """计算TM-score，参考score_predictor_TMscore_optimized.py的实现"""
+def calculate_tm_score(pdb_path1, pdb_path2, chain_id1=None, chain_id2=None):
+    """
+    计算TM-score，支持指定链ID。
+    
+    Args:
+        pdb_path1: 参考PDB路径 (原始结构)
+        pdb_path2: 查询PDB路径 (加噪后结构)
+        chain_id1: 参考PDB中要读取的链ID (如 'B')
+        chain_id2: 查询PDB中要读取的链ID (如果不指定，默认读取第一条链)
+    
+    Returns:
+        float: TM-score值，如果失败则返回None
+    """
     if not TMTOOLS_AVAILABLE:
         return None
     
     try:
         # 使用Bio.PDB解析PDB文件并提取CA坐标和序列
         parser = PDBParser(QUIET=True)
-        structure1 = parser.get_structure('target', pdb_path1)
-        structure2 = parser.get_structure('pred', pdb_path2)
-        
-        # 提取第一个结构的CA坐标和序列
-        coords1 = []
-        seq1 = []
-        for model in structure1:
+        structure1 = parser.get_structure('ref', pdb_path1)
+        structure2 = parser.get_structure('query', pdb_path2)
+
+        def get_coords_and_seq(structure, target_chain_id=None):
+            coords = []
+            seq = []
+            # 只读取第一个模型
+            model = next(iter(structure))
+            
             for chain in model:
+                # 如果指定了链ID，只处理该链；否则处理第一条链
+                if target_chain_id is not None:
+                    if chain.id != target_chain_id:
+                        continue
+                
                 for residue in chain:
                     if 'CA' in residue:
-                        coords1.append(residue['CA'].get_coord())
-                        seq1.append(residue.get_resname())
+                        coords.append(residue['CA'].get_coord())
+                        seq.append(residue.get_resname())
+                
+                # 如果没有指定链ID，只读取第一条链
+                if target_chain_id is None:
+                    break
+            
+            return np.array(coords, dtype=np.float64), seq
         
-        # 提取第二个结构的CA坐标和序列
-        coords2 = []
-        seq2 = []
-        for model in structure2:
-            for chain in model:
-                for residue in chain:
-                    if 'CA' in residue:
-                        coords2.append(residue['CA'].get_coord())
-                        seq2.append(residue.get_resname())
+        # 提取坐标和序列
+        # 原始结构：必须指定链ID (如 'B')
+        coords1, seq1 = get_coords_and_seq(structure1, chain_id1)
+        # 加噪后结构：通常只有一条链，可以不指定，或者指定为默认的 'A'
+        coords2, seq2 = get_coords_and_seq(structure2, chain_id2)
         
-        # 转换为numpy数组
-        coords1 = np.array(coords1, dtype=np.float64)
-        coords2 = np.array(coords2, dtype=np.float64)
-        
+        if len(coords1) == 0 or len(coords2) == 0:
+            print(f"警告: 未能在指定链中找到CA原子 (Chain1: {chain_id1}, Chain2: {chain_id2})")
+            return None
         # 将三字母氨基酸代码转换为单字母代码
-        from openfold.np.residue_constants import restype_3to1
+        from data.residue_constants import restype_3to1
         seq1_str = ''.join([restype_3to1.get(res, 'X') for res in seq1])
         seq2_str = ''.join([restype_3to1.get(res, 'X') for res in seq2])
         
@@ -177,12 +196,16 @@ def calculate_tm_score(pdb_path1, pdb_path2):
         tm_score = result.tm_norm_chain1
         
         print(f"\nTM-score计算结果: {tm_score:.4f}")
+        print(f"  原始结构残基数 (链{chain_id1}): {len(coords1)}")
+        print(f"  加噪后结构残基数 (链{chain_id2 or '第一条链'}): {len(coords2)}")
         
         # 返回TM-score值，与score_predictor_TMscore_optimized.py保持一致
         return tm_score
         
     except Exception as e:
         print(f"TM-score计算失败: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -401,7 +424,7 @@ def main():
         # 计算TM-score
         tm_result = None
         if TMTOOLS_AVAILABLE:
-            tm_result = calculate_tm_score(PDB_PATH, noised_pdb_path)
+            tm_result = calculate_tm_score(PDB_PATH, noised_pdb_path, chain_id1=CHAIN_ID, chain_id2=None)
         
         # 保存ground truth scores
         rot_score_path = None
