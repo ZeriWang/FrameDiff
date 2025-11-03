@@ -10,10 +10,10 @@
 
 结果:
   去噪后PDB: /home/zeriwang/lab/FrameDiff/test/output_dir_direct_denoising/1AKE_B_denoised.pdb
-  TM-score: 0.9812
+  TM-score: 0.9818
 
 最终Score信息:
   旋转Score shape: (1, 214, 3)
   平移Score shape: (1, 214, 3)
-  旋转Score统计: mean=0.236102, std=2.974781
-  平移Score统计: mean=-3.606864, std=64.672928
+  旋转Score统计: mean=0.250173, std=2.981533
+  平移Score统计: mean=-4.762986, std=66.045609

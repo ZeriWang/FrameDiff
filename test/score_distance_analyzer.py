@@ -5,9 +5,8 @@ Score距离分析器
 功能:
 1. 计算rot_score之间的欧氏距离和余弦距离
 2. 计算trans_score之间的欧氏距离和余弦距离
-3. 进行数据分析和可视化
+3. 进行数据分析
 
-作者: 基于direct_denoising_predictor.py输出的.npy文件
 """
 
 import os
@@ -15,6 +14,14 @@ import numpy as np
 from pathlib import Path
 from scipy.spatial.distance import cosine, euclidean
 from scipy.stats import pearsonr, spearmanr
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Set plotting style
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (14, 10)
+plt.rcParams['font.size'] = 10
+plt.rcParams['font.family'] = 'DejaVu Sans'  # Use English-friendly font
 
 # 获取项目根目录
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
@@ -339,14 +346,110 @@ def save_detailed_report(rot_results, trans_results, scores, output_dir):
     print(f"\n详细报告已保存: {report_path}")
 
 
+def plot_distance_matrix(results, score_type, output_dir):
+    """
+    Plot pairwise distance matrix visualizations
+    """
+    n_pairs = len(results['pairs'])
+    
+    if n_pairs == 0:
+        print("Not enough data to plot distance matrix")
+        return
+    
+    # Create distance matrices (symmetric)
+    n_files = int((1 + np.sqrt(1 + 8 * n_pairs)) / 2) + 1
+    
+    # For simplicity, create a bar plot showing all pairwise distances
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'{score_type.upper()} Score Distance Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Euclidean distances bar plot
+    ax = axes[0, 0]
+    x = np.arange(len(results['pairs']))
+    ax.bar(x, results['euclidean_distances'], alpha=0.8, color='steelblue')
+    ax.set_xlabel('Score Pairs', fontsize=12)
+    ax.set_ylabel('Euclidean Distance', fontsize=12)
+    ax.set_title('Pairwise Euclidean Distances', fontsize=13)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Pair {i+1}' for i in range(len(results['pairs']))], rotation=45, ha='right')
+    ax.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for i, v in enumerate(results['euclidean_distances']):
+        ax.text(i, v, f'{v:.2f}', ha='center', va='bottom', fontsize=8)
+    
+    # 2. Cosine distances bar plot
+    ax = axes[0, 1]
+    ax.bar(x, results['cosine_distances'], alpha=0.8, color='coral')
+    ax.set_xlabel('Score Pairs', fontsize=12)
+    ax.set_ylabel('Cosine Distance', fontsize=12)
+    ax.set_title('Pairwise Cosine Distances', fontsize=13)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Pair {i+1}' for i in range(len(results['pairs']))], rotation=45, ha='right')
+    ax.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for i, v in enumerate(results['cosine_distances']):
+        ax.text(i, v, f'{v:.4f}', ha='center', va='bottom', fontsize=8)
+    
+    # 3. Cosine similarities bar plot
+    ax = axes[1, 0]
+    ax.bar(x, results['cosine_similarities'], alpha=0.8, color='mediumseagreen')
+    ax.set_xlabel('Score Pairs', fontsize=12)
+    ax.set_ylabel('Cosine Similarity', fontsize=12)
+    ax.set_title('Pairwise Cosine Similarities', fontsize=13)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Pair {i+1}' for i in range(len(results['pairs']))], rotation=45, ha='right')
+    ax.axhline(y=1.0, color='red', linestyle='--', alpha=0.5, linewidth=2, label='Perfect Similarity')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add value labels on bars
+    for i, v in enumerate(results['cosine_similarities']):
+        ax.text(i, v, f'{v:.4f}', ha='center', va='bottom', fontsize=8)
+    
+    # 4. Statistics comparison
+    ax = axes[1, 1]
+    stats_data = {
+        'Mean Euc': [np.mean(per_res) for per_res in results['per_residue_euclidean']],
+        'Std Euc': [np.std(per_res) for per_res in results['per_residue_euclidean']],
+        'Mean Cos': [np.mean(per_res) for per_res in results['per_residue_cosine']],
+        'Std Cos': [np.std(per_res) for per_res in results['per_residue_cosine']],
+    }
+    
+    x_stat = np.arange(len(results['pairs']))
+    width = 0.2
+    
+    ax.bar(x_stat - 1.5*width, stats_data['Mean Euc'], width, label='Mean Euclidean', alpha=0.8)
+    ax.bar(x_stat - 0.5*width, stats_data['Std Euc'], width, label='Std Euclidean', alpha=0.8)
+    ax.bar(x_stat + 0.5*width, stats_data['Mean Cos'], width, label='Mean Cosine', alpha=0.8)
+    ax.bar(x_stat + 1.5*width, stats_data['Std Cos'], width, label='Std Cosine', alpha=0.8)
+    
+    ax.set_xlabel('Score Pairs', fontsize=12)
+    ax.set_ylabel('Value', fontsize=12)
+    ax.set_title('Per-Residue Statistics Comparison', fontsize=13)
+    ax.set_xticks(x_stat)
+    ax.set_xticklabels([f'Pair {i+1}' for i in range(len(results['pairs']))], rotation=45, ha='right')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, f'{score_type}_distance_analysis.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Distance analysis plot saved: {output_path}")
+    plt.close()
+
+
+
 def main():
     print("=" * 80)
     print("Score距离分析器")
     print("=" * 80)
     print("功能:")
-    print("  1. 计算rot_score之间的欧氏距离和余弦距离")
-    print("  2. 计算trans_score之间的欧氏距离和余弦距离")
-    print("  3. 进行数据分析和生成详细报告")
+    print("  1. 对所有rot_score文件进行两两距离计算")
+    print("  2. 对所有trans_score文件进行两两距离计算")
+    print("  3. 计算欧氏距离和余弦距离/相似度")
+    print("  4. 生成详细的文本报告和可视化图表")
     print("=" * 80)
     
     # 创建输出目录
@@ -373,6 +476,17 @@ def main():
     print(f"{'='*80}")
     trans_results = analyze_score_pairs(scores['trans'], 'trans')
     
+    # 生成可视化图表
+    print(f"\n{'='*80}")
+    print("生成可视化图表...")
+    print(f"{'='*80}")
+    
+    print("\n生成 ROT Score 可视化...")
+    plot_distance_matrix(rot_results, 'rot', OUTPUT_DIR)
+    
+    print("\n生成 TRANS Score 可视化...")
+    plot_distance_matrix(trans_results, 'trans', OUTPUT_DIR)
+    
     # 保存报告
     print(f"\n{'='*80}")
     print("保存分析报告...")
@@ -380,11 +494,21 @@ def main():
     
     save_detailed_report(rot_results, trans_results, scores, OUTPUT_DIR)
     
+    # 统计生成的文件
+    png_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.png')]
+    txt_files = [f for f in os.listdir(OUTPUT_DIR) if f.endswith('.txt')]
+    
     print(f"\n{'='*80}")
     print("分析完成！")
     print(f"{'='*80}")
     print(f"📁 输出目录: {OUTPUT_DIR}")
-    print(f"📋 详细报告: distance_analysis_report.txt")
+    print(f"📋 文本报告: {len(txt_files)} 个")
+    print(f"📊 可视化图表: {len(png_files)} 个")
+    print(f"\n生成的图表:")
+    for score_type in ['rot', 'trans']:
+        print(f"  - {score_type}_distance_analysis.png")
+        print(f"  - {score_type}_per_residue_analysis.png")
+        print(f"  - {score_type}_correlation_analysis.png")
     print(f"{'='*80}")
 
 
