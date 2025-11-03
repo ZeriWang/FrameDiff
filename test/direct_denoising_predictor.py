@@ -39,7 +39,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 
 # 输入参数
-PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1AKE.pdb')
+PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '4AKE.pdb')
 CHAIN_ID = 'B'
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')

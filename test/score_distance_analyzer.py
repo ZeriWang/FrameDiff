@@ -31,22 +31,26 @@ INPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'score_analysis_output')
 
 
-def load_score_pairs(input_dir, prefix='1AKE_B'):
+def load_score_pairs(input_dir, prefix=None):
     """
     加载成对的score文件
     
     Args:
         input_dir: 包含.npy文件的目录
-        prefix: 文件名前缀
+        prefix: 文件名前缀（如果为None，则加载所有文件）
     
     Returns:
         dict: 包含rot和trans score对的字典
     """
     scores = {}
     
-    # 查找所有匹配的文件
-    rot_files = sorted([f for f in os.listdir(input_dir) if f.startswith(prefix) and 'rot_score' in f and f.endswith('.npy')])
-    trans_files = sorted([f for f in os.listdir(input_dir) if f.startswith(prefix) and 'trans_score' in f and f.endswith('.npy')])
+    # 查找所有匹配的文件（不限制前缀）
+    if prefix is None:
+        rot_files = sorted([f for f in os.listdir(input_dir) if 'rot_score' in f and f.endswith('.npy')])
+        trans_files = sorted([f for f in os.listdir(input_dir) if 'trans_score' in f and f.endswith('.npy')])
+    else:
+        rot_files = sorted([f for f in os.listdir(input_dir) if f.startswith(prefix) and 'rot_score' in f and f.endswith('.npy')])
+        trans_files = sorted([f for f in os.listdir(input_dir) if f.startswith(prefix) and 'trans_score' in f and f.endswith('.npy')])
     
     print(f"找到 {len(rot_files)} 个rot_score文件")
     print(f"找到 {len(trans_files)} 个trans_score文件")
@@ -348,7 +352,7 @@ def save_detailed_report(rot_results, trans_results, scores, output_dir):
 
 def plot_distance_matrix(results, score_type, output_dir):
     """
-    Plot pairwise distance matrix visualizations
+    Plot pairwise distance matrix heatmap
     """
     n_pairs = len(results['pairs'])
     
@@ -440,14 +444,201 @@ def plot_distance_matrix(results, score_type, output_dir):
     plt.close()
 
 
+def plot_per_residue_distances(results, score_type, output_dir):
+    """
+    Plot per-residue distance distributions
+    """
+    n_pairs = len(results['pairs'])
+    
+    if n_pairs == 0:
+        print("Not enough data to plot per-residue distances")
+        return
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'{score_type.upper()} Score Per-Residue Distance Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Euclidean distance curves
+    ax = axes[0, 0]
+    for i, per_res_dist in enumerate(results['per_residue_euclidean']):
+        ax.plot(per_res_dist, alpha=0.7, linewidth=2, label=f'Pair {i+1}')
+    ax.set_xlabel('Residue Index', fontsize=12)
+    ax.set_ylabel('Euclidean Distance', fontsize=12)
+    ax.set_title('Per-Residue Euclidean Distances', fontsize=13)
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # 2. Cosine distance curves
+    ax = axes[0, 1]
+    for i, per_res_dist in enumerate(results['per_residue_cosine']):
+        ax.plot(per_res_dist, alpha=0.7, linewidth=2, label=f'Pair {i+1}')
+    ax.set_xlabel('Residue Index', fontsize=12)
+    ax.set_ylabel('Cosine Distance', fontsize=12)
+    ax.set_title('Per-Residue Cosine Distances', fontsize=13)
+    ax.legend(loc='best', fontsize=9)
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Euclidean distance box plots
+    ax = axes[1, 0]
+    data_euc = [per_res for per_res in results['per_residue_euclidean']]
+    if data_euc:
+        bp = ax.boxplot(data_euc, labels=[f'Pair {i+1}' for i in range(len(data_euc))],
+                        patch_artist=True, showmeans=True)
+        for patch in bp['boxes']:
+            patch.set_facecolor('lightblue')
+        ax.set_xlabel('Score Pairs', fontsize=12)
+        ax.set_ylabel('Euclidean Distance', fontsize=12)
+        ax.set_title('Euclidean Distance Distribution (Box Plot)', fontsize=13)
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # 4. Cosine distance box plots
+    ax = axes[1, 1]
+    data_cos = [per_res for per_res in results['per_residue_cosine']]
+    if data_cos:
+        bp = ax.boxplot(data_cos, labels=[f'Pair {i+1}' for i in range(len(data_cos))],
+                        patch_artist=True, showmeans=True)
+        for patch in bp['boxes']:
+            patch.set_facecolor('lightcoral')
+        ax.set_xlabel('Score Pairs', fontsize=12)
+        ax.set_ylabel('Cosine Distance', fontsize=12)
+        ax.set_title('Cosine Distance Distribution (Box Plot)', fontsize=13)
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, f'{score_type}_per_residue_analysis.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Per-residue analysis plot saved: {output_path}")
+    plt.close()
+
+
+def plot_distance_heatmap(results, score_type, output_dir):
+    """
+    Plot distance heatmap for better visualization of all pairwise comparisons
+    """
+    n_pairs = len(results['pairs'])
+    
+    if n_pairs == 0:
+        print("Not enough data to plot heatmap")
+        return
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle(f'{score_type.upper()} Score Distance Heatmap', fontsize=16, fontweight='bold')
+    
+    # Prepare data for heatmap
+    euc_data = np.array(results['euclidean_distances']).reshape(1, -1)
+    cos_data = np.array(results['cosine_distances']).reshape(1, -1)
+    sim_data = np.array(results['cosine_similarities']).reshape(1, -1)
+    
+    # 1. Euclidean distance heatmap
+    ax = axes[0]
+    sns.heatmap(euc_data, annot=True, fmt='.2f', cmap='YlOrRd', ax=ax, 
+                xticklabels=[f'Pair {i+1}' for i in range(n_pairs)],
+                yticklabels=['Euclidean'], cbar_kws={'label': 'Distance'})
+    ax.set_title('Euclidean Distances', fontsize=13)
+    
+    # 2. Cosine distance heatmap
+    ax = axes[1]
+    sns.heatmap(cos_data, annot=True, fmt='.4f', cmap='YlGnBu', ax=ax,
+                xticklabels=[f'Pair {i+1}' for i in range(n_pairs)],
+                yticklabels=['Cosine'], cbar_kws={'label': 'Distance'})
+    ax.set_title('Cosine Distances', fontsize=13)
+    
+    # 3. Cosine similarity heatmap
+    ax = axes[2]
+    sns.heatmap(sim_data, annot=True, fmt='.4f', cmap='RdYlGn', ax=ax,
+                xticklabels=[f'Pair {i+1}' for i in range(n_pairs)],
+                yticklabels=['Similarity'], cbar_kws={'label': 'Similarity'})
+    ax.set_title('Cosine Similarities', fontsize=13)
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, f'{score_type}_distance_heatmap.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Distance heatmap saved: {output_path}")
+    plt.close()
+
+
+def plot_correlation_analysis(results, score_type, output_dir):
+    """
+    Plot correlation analysis between different pairs
+    """
+    n_pairs = len(results['pairs'])
+    
+    if n_pairs == 0:
+        print("Not enough data for correlation analysis")
+        return
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f'{score_type.upper()} Score Correlation Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Euclidean vs Cosine distance scatter
+    ax = axes[0, 0]
+    ax.scatter(results['euclidean_distances'], results['cosine_distances'], 
+               s=100, alpha=0.6, c=range(n_pairs), cmap='viridis')
+    ax.set_xlabel('Euclidean Distance', fontsize=12)
+    ax.set_ylabel('Cosine Distance', fontsize=12)
+    ax.set_title('Euclidean vs Cosine Distance', fontsize=13)
+    ax.grid(True, alpha=0.3)
+    
+    # Add correlation coefficient
+    if n_pairs > 1:
+        corr, _ = pearsonr(results['euclidean_distances'], results['cosine_distances'])
+        ax.text(0.05, 0.95, f'Pearson r = {corr:.4f}', 
+                transform=ax.transAxes, fontsize=11, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 2. Cosine distance vs similarity
+    ax = axes[0, 1]
+    ax.scatter(results['cosine_distances'], results['cosine_similarities'], 
+               s=100, alpha=0.6, c=range(n_pairs), cmap='viridis')
+    ax.set_xlabel('Cosine Distance', fontsize=12)
+    ax.set_ylabel('Cosine Similarity', fontsize=12)
+    ax.set_title('Cosine Distance vs Similarity', fontsize=13)
+    ax.grid(True, alpha=0.3)
+    
+    # 3. Mean per-residue distances comparison
+    ax = axes[1, 0]
+    mean_euc = [np.mean(per_res) for per_res in results['per_residue_euclidean']]
+    mean_cos = [np.mean(per_res) for per_res in results['per_residue_cosine']]
+    ax.scatter(mean_euc, mean_cos, s=100, alpha=0.6, c=range(n_pairs), cmap='viridis')
+    ax.set_xlabel('Mean Per-Residue Euclidean Distance', fontsize=12)
+    ax.set_ylabel('Mean Per-Residue Cosine Distance', fontsize=12)
+    ax.set_title('Mean Per-Residue Distance Comparison', fontsize=13)
+    ax.grid(True, alpha=0.3)
+    
+    if n_pairs > 1:
+        corr, _ = pearsonr(mean_euc, mean_cos)
+        ax.text(0.05, 0.95, f'Pearson r = {corr:.4f}', 
+                transform=ax.transAxes, fontsize=11, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # 4. Histogram of all distances
+    ax = axes[1, 1]
+    all_euc = np.concatenate(results['per_residue_euclidean'])
+    all_cos = np.concatenate(results['per_residue_cosine'])
+    
+    ax.hist(all_euc, bins=50, alpha=0.5, label='Euclidean', density=True, color='steelblue')
+    ax.hist(all_cos, bins=50, alpha=0.5, label='Cosine', density=True, color='coral')
+    ax.set_xlabel('Distance Value', fontsize=12)
+    ax.set_ylabel('Density', fontsize=12)
+    ax.set_title('Overall Distance Distribution', fontsize=13)
+    ax.legend(fontsize=11)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    output_path = os.path.join(output_dir, f'{score_type}_correlation_analysis.png')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    print(f"Correlation analysis plot saved: {output_path}")
+    plt.close()
+
 
 def main():
     print("=" * 80)
     print("Score距离分析器")
     print("=" * 80)
     print("功能:")
-    print("  1. 对所有rot_score文件进行两两距离计算")
-    print("  2. 对所有trans_score文件进行两两距离计算")
+    print("  1. 对目录下所有rot_score文件进行两两距离计算")
+    print("  2. 对目录下所有trans_score文件进行两两距离计算")
     print("  3. 计算欧氏距离和余弦距离/相似度")
     print("  4. 生成详细的文本报告和可视化图表")
     print("=" * 80)
@@ -456,9 +647,10 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print(f"\n输出目录: {OUTPUT_DIR}")
     
-    # 加载score文件
+    # 加载score文件（不限制前缀，加载所有文件）
     print(f"\n正在加载score文件...")
-    scores = load_score_pairs(INPUT_DIR)
+    print(f"输入目录: {INPUT_DIR}")
+    scores = load_score_pairs(INPUT_DIR, prefix=None)
     
     if len(scores['rot']) < 2 or len(scores['trans']) < 2:
         print("\n警告: 需要至少2个rot_score文件和2个trans_score文件进行分析")
@@ -483,9 +675,15 @@ def main():
     
     print("\n生成 ROT Score 可视化...")
     plot_distance_matrix(rot_results, 'rot', OUTPUT_DIR)
+    plot_per_residue_distances(rot_results, 'rot', OUTPUT_DIR)
+    plot_distance_heatmap(rot_results, 'rot', OUTPUT_DIR)
+    plot_correlation_analysis(rot_results, 'rot', OUTPUT_DIR)
     
     print("\n生成 TRANS Score 可视化...")
     plot_distance_matrix(trans_results, 'trans', OUTPUT_DIR)
+    plot_per_residue_distances(trans_results, 'trans', OUTPUT_DIR)
+    plot_distance_heatmap(trans_results, 'trans', OUTPUT_DIR)
+    plot_correlation_analysis(trans_results, 'trans', OUTPUT_DIR)
     
     # 保存报告
     print(f"\n{'='*80}")
@@ -508,6 +706,7 @@ def main():
     for score_type in ['rot', 'trans']:
         print(f"  - {score_type}_distance_analysis.png")
         print(f"  - {score_type}_per_residue_analysis.png")
+        print(f"  - {score_type}_distance_heatmap.png")
         print(f"  - {score_type}_correlation_analysis.png")
     print(f"{'='*80}")
 
