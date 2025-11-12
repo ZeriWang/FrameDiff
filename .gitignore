@@ -189,3 +189,4 @@ test/output_dir_batch/
 test/output_dir_test/
 test/output_dir_direct_denoising/
 test/score_analysis_output/
+test/output_dir_adaptive_denoising/
