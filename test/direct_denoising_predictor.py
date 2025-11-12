@@ -39,7 +39,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 
 # 输入参数
-PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '4AKE.pdb')
+PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1AKE.pdb')
 CHAIN_ID = 'B'
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
@@ -49,7 +49,7 @@ CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 NUM_DENOISING_STEPS = 1      # 去噪步数
 MIN_T = 0.01                 # 最小时间步
 MAX_T = 0.05                 # 最大时间步（从很小的噪声开始）
-NOISE_SCALE = 0.1          # 极小的噪声缩放因子
+NOISE_SCALE = 0.1            # 极小的噪声缩放因子
 ENABLE_SELF_CONDITIONING = True  # 启用自条件
 SAVE_SCORES = True           # 保存最终分数
 
