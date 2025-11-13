@@ -41,13 +41,7 @@ from openfold.utils import rigid_utils as ru
 from openfold.np import protein
 from openfold.np import residue_constants
 
-try:
-    import tmtools
-    from Bio.PDB import PDBParser
-    TMTOOLS_AVAILABLE = True
-except ImportError:
-    TMTOOLS_AVAILABLE = False
-    print("Warning: tmtools not available, TM-score calculation will be skipped")
+# TM-score和可视化功能已移除
 
 # ==================== 配置参数 ====================
 # 输入参数
@@ -150,69 +144,6 @@ def save_protein_to_pdb(prot, output_path):
         f.write(pdb_string)
 
 
-def calculate_tm_score(pdb_path1, pdb_path2, chain_id1=None, chain_id2=None):
-    """计算TM-score"""
-    if not TMTOOLS_AVAILABLE:
-        return None
-    
-    try:
-        parser = PDBParser(QUIET=True)
-        
-        struct1 = parser.get_structure('ref', pdb_path1)
-        if chain_id1:
-            chain1 = struct1[0][chain_id1]
-        else:
-            chain1 = list(struct1.get_chains())[0]
-        
-        coords1 = []
-        seq1 = []
-        for res in chain1.get_residues():
-            if 'CA' in res:
-                coords1.append(res['CA'].coord)
-                seq1.append(res.resname)
-        
-        struct2 = parser.get_structure('query', pdb_path2)
-        if chain_id2:
-            chain2 = struct2[0][chain_id2]
-        else:
-            chain2 = list(struct2.get_chains())[0]
-        
-        coords2 = []
-        seq2 = []
-        for res in chain2.get_residues():
-            if 'CA' in res:
-                coords2.append(res['CA'].coord)
-                seq2.append(res.resname)
-        
-        coords1 = np.array(coords1)
-        coords2 = np.array(coords2)
-        
-        if coords1.shape[0] != coords2.shape[0]:
-            min_len = min(coords1.shape[0], coords2.shape[0])
-            coords1 = coords1[:min_len]
-            coords2 = coords2[:min_len]
-            seq1 = seq1[:min_len]
-            seq2 = seq2[:min_len]
-        
-        tm_result = tmtools.tm_score(coords1, coords2, seq1, seq2)
-        return tm_result.tm_norm_chain1
-        
-    except Exception as e:
-        print(f"计算TM-score时出错: {e}")
-        return None
-
-
-def calculate_rmsd(coords1, coords2):
-    """计算RMSD"""
-    if coords1.shape != coords2.shape:
-        min_len = min(coords1.shape[0], coords2.shape[0])
-        coords1 = coords1[:min_len]
-        coords2 = coords2[:min_len]
-    
-    diff = coords1 - coords2
-    return np.sqrt(np.mean(np.sum(diff**2, axis=1)))
-
-
 def direct_denoising(
         model,
         diffuser,
@@ -229,16 +160,7 @@ def direct_denoising(
         noise_scale=0.1,
         enable_self_conditioning=True,
     ):
-    """
-    直接去噪过程：从原始结构开始，进行轻微的去噪优化
-    
-    返回:
-        dict: 包含最终结构、score历史、以及最后一步的score
-    """
-    print(f"开始直接去噪过程...")
-    print(f"  去噪步数: {num_steps}")
-    print(f"  时间范围: {min_t} -> {max_t}")
-    print(f"  噪声缩放: {noise_scale}")
+    """直接去噪过程"""
     
     # 准备输入特征
     sample_feats = {
@@ -252,7 +174,7 @@ def direct_denoising(
     
     batch_size = sample_feats['rigids_t'].shape[0]
     
-    # 创建去噪时间步序列（从max_t到min_t）
+    # 创建去噪时间步序列
     denoising_steps = np.linspace(max_t, min_t, num_steps)
     dt = (max_t - min_t) / max(num_steps - 1, 1)
     
@@ -269,65 +191,58 @@ def direct_denoising(
     )
 
     def set_t_feats(feats, t_value):
-        feats['t'] = t_placeholder * float(t_value)
-        rot_scale, trans_scale = diffuser.score_scaling(float(t_value))
-        feats['rot_score_scaling'] = torch.full((batch_size,), float(rot_scale), device=device)
-        feats['trans_score_scaling'] = torch.full((batch_size,), float(trans_scale), device=device)
+        feats['t'] = t_placeholder * t_value
+        feats['so3_t'] = t_placeholder * t_value
+        feats['r3_t'] = t_placeholder * t_value
         return feats
 
-    # 保存最后一步的score
     final_rot_score = None
     final_trans_score = None
 
     with torch.no_grad():
-        # 自条件初始化
-        if embed_self_conditioning and len(denoising_steps) > 0:
-            set_t_feats(sample_feats, denoising_steps[0])
-            model_sc = model(sample_feats)
-            sample_feats['sc_ca_t'] = model_sc['rigids'][..., 4:]
-
-        # 逆向去噪循环
-        for step_idx, t in enumerate(tqdm(denoising_steps, desc="去噪进行中")):
-            set_t_feats(sample_feats, t)
+        rigids_t = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
+        
+        for step_idx, t in enumerate(denoising_steps):
+            sample_feats = set_t_feats(sample_feats, t)
+            sample_feats['rigids_t'] = rigids_t.to_tensor_7()
+            
+            if step_idx == 0:
+                sample_feats['sc_ca_t'] = sc_ca.unsqueeze(0).to(device)
+            else:
+                sample_feats['sc_ca_t'] = rigids_t.get_trans()
+            
             model_out = model(sample_feats)
-            rot_score = model_out['rot_score']
-            trans_score = model_out['trans_score']
-
-            # 保存所有时间步的score
-            all_rot_scores.append({'t': float(t), 'score': du.move_to_np(rot_score)})
-            all_trans_scores.append({'t': float(t), 'score': du.move_to_np(trans_score)})
-
-            # 如果是最后一步，保存score
-            if step_idx == len(denoising_steps) - 1:
-                final_rot_score = du.move_to_np(rot_score).copy()
-                final_trans_score = du.move_to_np(trans_score).copy()
-
-            # 执行去噪步骤
-            if t > min_t:
-                current_rigid = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
+            
+            rot_score = model_out['rot_score'].detach().cpu()
+            trans_score = model_out['trans_score'].detach().cpu()
+            
+            all_rot_scores.append(rot_score.numpy())
+            all_trans_scores.append(trans_score.numpy())
+            
+            if step_idx == num_steps - 1:
+                final_rot_score = rot_score.numpy()
+                final_trans_score = trans_score.numpy()
+            
+            if step_idx < num_steps - 1:
+                # 转换score为numpy数组
+                rot_score_np = rot_score.numpy()
+                trans_score_np = trans_score.numpy()
+                
+                # 应用噪声缩放
+                rot_score_scaled = rot_score_np * noise_scale
+                trans_score_scaled = trans_score_np * noise_scale
                 
                 rigids_t = diffuser.reverse(
-                    rigid_t=current_rigid,
-                    rot_score=du.move_to_np(rot_score),
-                    trans_score=du.move_to_np(trans_score),
+                    rigid_t=rigids_t,
+                    rot_score=rot_score_scaled,
+                    trans_score=trans_score_scaled,
                     diffuse_mask=diffuse_mask,
                     t=float(t),
                     dt=dt,
-                    center=True,
-                    noise_scale=noise_scale,
+                    center=False,
+                    noise_scale=1.0,
                 )
-                
-                # 确保结果移回GPU
-                rigids_t_tensor = rigids_t.to_tensor_7().to(device)
-                sample_feats['rigids_t'] = rigids_t_tensor
-                
-                if embed_self_conditioning:
-                    sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
-            else:
-                rigids_t = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
 
-    print(f"去噪完成！")
-    
     return {
         'final_rigids': rigids_t,
         'all_rot_scores': all_rot_scores,
@@ -337,8 +252,6 @@ def direct_denoising(
         'fixed_mask': fixed_mask_np,
         'diffuse_mask': diffuse_mask,
     }
-
-
 
 
 def run_single_experiment(model, diffuser, chain_feats, pdb_feats, bb_mask, 
@@ -414,16 +327,6 @@ def run_single_experiment(model, diffuser, chain_feats, pdb_feats, bb_mask,
     np.save(os.path.join(output_subdir, trans_score_filename), 
             denoising_result['final_trans_score'])
     
-    # 计算TM-score
-    tm_score = calculate_tm_score(PDB_PATH, pdb_path, CHAIN_ID, None)
-    
-    # 计算RMSD
-    original_ca = sc_ca_init
-    final_ca = final_rigids.get_trans().detach().cpu().numpy()
-    if final_ca.ndim == 3:
-        final_ca = final_ca[0]
-    rmsd = calculate_rmsd(original_ca, final_ca)
-    
     # 计算Score统计
     rot_score_norm = np.linalg.norm(denoising_result['final_rot_score'])
     trans_score_norm = np.linalg.norm(denoising_result['final_trans_score'])
@@ -431,8 +334,6 @@ def run_single_experiment(model, diffuser, chain_feats, pdb_feats, bb_mask,
     result = {
         'num_steps': num_steps,
         'max_t': max_t,
-        'tm_score': tm_score,
-        'rmsd': rmsd,
         'rot_score_norm': rot_score_norm,
         'trans_score_norm': trans_score_norm,
         'pdb_path': pdb_path,
@@ -443,103 +344,7 @@ def run_single_experiment(model, diffuser, chain_feats, pdb_feats, bb_mask,
     return result
 
 
-def create_visualizations(df, output_dir):
-    """创建可视化图表"""
-    
-    # 设置绘图风格
-    sns.set_style("whitegrid")
-    plt.rcParams['figure.figsize'] = (15, 10)
-    
-    # 1. TM-score vs 参数热图
-    if 'tm_score' in df.columns and df['tm_score'].notna().any():
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # TM-score热图
-        pivot_tm = df.pivot(index='num_steps', columns='max_t', values='tm_score')
-        sns.heatmap(pivot_tm, annot=True, fmt='.4f', cmap='YlOrRd', ax=axes[0, 0])
-        axes[0, 0].set_title('TM-Score Heatmap')
-        axes[0, 0].set_xlabel('MAX_T')
-        axes[0, 0].set_ylabel('NUM_STEPS')
-        
-        # RMSD热图
-        pivot_rmsd = df.pivot(index='num_steps', columns='max_t', values='rmsd')
-        sns.heatmap(pivot_rmsd, annot=True, fmt='.2f', cmap='YlGnBu', ax=axes[0, 1])
-        axes[0, 1].set_title('RMSD Heatmap')
-        axes[0, 1].set_xlabel('MAX_T')
-        axes[0, 1].set_ylabel('NUM_STEPS')
-        
-        # Rotation Score Norm热图
-        pivot_rot = df.pivot(index='num_steps', columns='max_t', values='rot_score_norm')
-        sns.heatmap(pivot_rot, annot=True, fmt='.2f', cmap='RdPu', ax=axes[1, 0])
-        axes[1, 0].set_title('Rotation Score Norm Heatmap')
-        axes[1, 0].set_xlabel('MAX_T')
-        axes[1, 0].set_ylabel('NUM_STEPS')
-        
-        # Translation Score Norm热图
-        pivot_trans = df.pivot(index='num_steps', columns='max_t', values='trans_score_norm')
-        sns.heatmap(pivot_trans, annot=True, fmt='.2f', cmap='Greens', ax=axes[1, 1])
-        axes[1, 1].set_title('Translation Score Norm Heatmap')
-        axes[1, 1].set_xlabel('MAX_T')
-        axes[1, 1].set_ylabel('NUM_STEPS')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'heatmaps.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    # 2. 参数影响趋势图
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # NUM_STEPS的影响
-    for max_t in MAX_T_LIST:
-        subset = df[df['max_t'] == max_t]
-        if 'tm_score' in subset.columns and subset['tm_score'].notna().any():
-            axes[0, 0].plot(subset['num_steps'], subset['tm_score'], 
-                          marker='o', label=f'MAX_T={max_t}')
-    axes[0, 0].set_xlabel('NUM_STEPS')
-    axes[0, 0].set_ylabel('TM-Score')
-    axes[0, 0].set_title('TM-Score vs NUM_STEPS')
-    axes[0, 0].legend()
-    axes[0, 0].set_xscale('log')
-    axes[0, 0].grid(True)
-    
-    # MAX_T的影响
-    for num_steps in NUM_STEPS_LIST:
-        subset = df[df['num_steps'] == num_steps]
-        if 'tm_score' in subset.columns and subset['tm_score'].notna().any():
-            axes[0, 1].plot(subset['max_t'], subset['tm_score'], 
-                          marker='s', label=f'STEPS={num_steps}')
-    axes[0, 1].set_xlabel('MAX_T')
-    axes[0, 1].set_ylabel('TM-Score')
-    axes[0, 1].set_title('TM-Score vs MAX_T')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    # RMSD vs NUM_STEPS
-    for max_t in MAX_T_LIST:
-        subset = df[df['max_t'] == max_t]
-        axes[1, 0].plot(subset['num_steps'], subset['rmsd'], 
-                       marker='o', label=f'MAX_T={max_t}')
-    axes[1, 0].set_xlabel('NUM_STEPS')
-    axes[1, 0].set_ylabel('RMSD (Å)')
-    axes[1, 0].set_title('RMSD vs NUM_STEPS')
-    axes[1, 0].legend()
-    axes[1, 0].set_xscale('log')
-    axes[1, 0].grid(True)
-    
-    # Score Norms比较
-    x = np.arange(len(df))
-    width = 0.35
-    axes[1, 1].bar(x - width/2, df['rot_score_norm'], width, label='Rotation', alpha=0.8)
-    axes[1, 1].bar(x + width/2, df['trans_score_norm'], width, label='Translation', alpha=0.8)
-    axes[1, 1].set_xlabel('Experiment Index')
-    axes[1, 1].set_ylabel('Score Norm')
-    axes[1, 1].set_title('Score Norms Comparison')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'trend_plots.png'), dpi=300, bbox_inches='tight')
-    plt.close()
+# 可视化功能已移除
 
 
 def generate_report(df, output_dir):
@@ -572,37 +377,10 @@ def generate_report(df, output_dir):
         f.write(df.describe().to_string())
         f.write("\n\n")
         
-        if 'tm_score' in df.columns and df['tm_score'].notna().any():
-            f.write("=" * 80 + "\n")
-            f.write("最佳结果 (按TM-Score)\n")
-            f.write("=" * 80 + "\n")
-            best_idx = df['tm_score'].idxmax()
-            best_row = df.loc[best_idx]
-            f.write(f"NUM_STEPS: {best_row['num_steps']}\n")
-            f.write(f"MAX_T: {best_row['max_t']}\n")
-            f.write(f"TM-Score: {best_row['tm_score']:.4f}\n")
-            f.write(f"RMSD: {best_row['rmsd']:.4f} Å\n")
-            f.write(f"Rotation Score Norm: {best_row['rot_score_norm']:.4f}\n")
-            f.write(f"Translation Score Norm: {best_row['trans_score_norm']:.4f}\n\n")
-            
-            f.write("=" * 80 + "\n")
-            f.write("最差结果 (按TM-Score)\n")
-            f.write("=" * 80 + "\n")
-            worst_idx = df['tm_score'].idxmin()
-            worst_row = df.loc[worst_idx]
-            f.write(f"NUM_STEPS: {worst_row['num_steps']}\n")
-            f.write(f"MAX_T: {worst_row['max_t']}\n")
-            f.write(f"TM-Score: {worst_row['tm_score']:.4f}\n")
-            f.write(f"RMSD: {worst_row['rmsd']:.4f} Å\n")
-            f.write(f"Rotation Score Norm: {worst_row['rot_score_norm']:.4f}\n")
-            f.write(f"Translation Score Norm: {worst_row['trans_score_norm']:.4f}\n\n")
-        
         f.write("=" * 80 + "\n")
         f.write("按NUM_STEPS分组统计\n")
         f.write("=" * 80 + "\n")
         grouped_steps = df.groupby('num_steps').agg({
-            'tm_score': ['mean', 'std', 'min', 'max'] if 'tm_score' in df.columns else [],
-            'rmsd': ['mean', 'std', 'min', 'max'],
             'rot_score_norm': ['mean', 'std'],
             'trans_score_norm': ['mean', 'std']
         })
@@ -613,8 +391,6 @@ def generate_report(df, output_dir):
         f.write("按MAX_T分组统计\n")
         f.write("=" * 80 + "\n")
         grouped_maxt = df.groupby('max_t').agg({
-            'tm_score': ['mean', 'std', 'min', 'max'] if 'tm_score' in df.columns else [],
-            'rmsd': ['mean', 'std', 'min', 'max'],
             'rot_score_norm': ['mean', 'std'],
             'trans_score_norm': ['mean', 'std']
         })
@@ -722,8 +498,7 @@ def main():
                     
                     results.append(result)
                     
-                    tm_str = f"{result['tm_score']:.4f}" if result['tm_score'] is not None else "N/A"
-                    print(f"  ✓ TM-Score: {tm_str}")
+                    print(f"  ✓ TM-Score: {result['tm_score']:.4f if result['tm_score'] else 'N/A'}")
                     print(f"  ✓ RMSD: {result['rmsd']:.4f} Å")
                     print(f"  ✓ 文件已保存到: {output_subdir}")
                     
@@ -742,14 +517,6 @@ def main():
     df.to_csv(csv_path, index=False)
     print(f"\n✅ 结果CSV已保存: {csv_path}")
     
-    # 生成可视化
-    print("\n生成可视化图表...")
-    try:
-        create_visualizations(df, RUN_OUTPUT_DIR)
-        print("✅ 可视化图表已生成")
-    except Exception as e:
-        print(f"⚠️ 可视化生成失败: {e}")
-    
     # 生成报告
     print("\n生成分析报告...")
     try:
@@ -763,8 +530,7 @@ def main():
     print("=" * 80)
     print(f"📁 所有结果保存在: {RUN_OUTPUT_DIR}")
     print(f"📊 结果CSV: results.csv")
-    print(f"📈 可视化图表: heatmaps.png, trend_plots.png")
-    print(f"📄 分析报告: analysis_report.txt")
+    print(f" 分析报告: analysis_report.txt")
     print("=" * 80)
 
 
