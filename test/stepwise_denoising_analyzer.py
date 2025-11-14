@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-直接去噪版Score预测器
+逐步去噪分析器
 
 功能:
-1. 跳过前向加噪过程，直接对原始PDB结构进行去噪
-2. 使用逆向扩散过程对结构进行精细调整
-3. 计算去噪后结构与原始结构的TM-score
-4. 输出最后一步的旋转分数和平移分数为.npy格式
+1. 与direct_denoising_predictor.py相同的去噪功能
+2. 每进行一步去噪，就保存该步的旋转分数和平移分数为.npy格式
+3. 去噪结束后，自动调用score_distance_analyzer.py进行分析
 
-基于: score_predictor_TMscore_optimized.py
+基于: direct_denoising_predictor.py
 """
 import os
 import sys
-import copy
 import torch
 import numpy as np
+import traceback
+import subprocess
 from tqdm import tqdm
 from omegaconf import OmegaConf
 from pathlib import Path
@@ -39,19 +39,19 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 
 # 输入参数
-PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '3UC5.pdb')
+PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1TFU.pdb')
 CHAIN_ID = 'A'
-OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
+OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_stepwise_denoising')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
 CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 
 # 直接去噪参数
-NUM_DENOISING_STEPS = 1      # 去噪步数
+NUM_DENOISING_STEPS = 5     # 去噪步数
 MIN_T = 0.01                 # 最小时间步
 MAX_T = 0.05                 # 最大时间步（从很小的噪声开始）
 NOISE_SCALE = 0              # 极小的噪声缩放因子
 ENABLE_SELF_CONDITIONING = True  # 启用自条件
-SAVE_SCORES = True           # 保存最终分数
+SAVE_STEPWISE_SCORES = True  # 保存每步的分数
 
 
 def process_chain_feats(pdb_feats):
@@ -157,22 +157,17 @@ def calculate_tm_score(pdb_path1, pdb_path2, chain_id1=None, chain_id2=None):
             model = next(iter(structure))
             
             for chain in model:
-                # 如果指定了链ID，进行过滤
-                if target_chain_id is not None and chain.get_id() != target_chain_id:
+                if target_chain_id is not None and chain.id != target_chain_id:
                     continue
-                
                 for residue in chain:
-                    # 过滤掉非标准残基(HETATM)
-                    if residue.id[0] != ' ':
-                        continue
-                    if 'CA' in residue:
-                        coords.append(residue['CA'].get_coord())
-                        seq.append(residue.get_resname())
-                
-                # 如果找到了目标链，读取完就退出循环，避免读取多条链
-                if target_chain_id is not None and chain.get_id() == target_chain_id:
+                    if residue.id[0] == ' ':
+                        if 'CA' in residue:
+                            coords.append(residue['CA'].get_coord())
+                            seq.append(residue.get_resname())
+                if target_chain_id is not None:
                     break
-            return np.array(coords, dtype=np.float64), seq
+            
+            return np.array(coords), seq
 
         # 提取坐标和序列
         # 原始结构：必须指定链ID (如 'B')
@@ -216,7 +211,7 @@ def move_to_device(obj, device):
         return obj
 
 
-def direct_denoising(
+def stepwise_denoising(
         model,
         diffuser,
         original_rigids,
@@ -231,17 +226,20 @@ def direct_denoising(
         device='cuda',
         noise_scale=0.1,
         enable_self_conditioning=True,
+        output_dir=None,
+        output_prefix=None,
     ):
     """
-    直接去噪过程：从原始结构开始，进行轻微的去噪优化
+    逐步去噪过程：从原始结构开始，进行轻微的去噪优化，每步保存分数
     
     返回:
-        dict: 包含最终结构、score历史、以及最后一步的score
+        dict: 包含最终结构、score历史、以及所有保存的分数文件路径
     """
-    print(f"开始直接去噪过程...")
+    print(f"开始逐步去噪过程...")
     print(f"  去噪步数: {num_steps}")
     print(f"  时间范围: {min_t} -> {max_t}")
     print(f"  噪声缩放: {noise_scale}")
+    print(f"  每步保存分数: {SAVE_STEPWISE_SCORES}")
     
     # 准备输入特征
     sample_feats = {
@@ -257,13 +255,16 @@ def direct_denoising(
     
     # 创建去噪时间步序列（从max_t到min_t）
     denoising_steps = np.linspace(max_t, min_t, num_steps)
-    dt = (max_t - min_t) / max(num_steps - 1, 1)
+    dt = float((max_t - min_t) / max(num_steps - 1, 1))  # dt为正数，表示步长大小
     
     all_rot_scores = []
     all_trans_scores = []
+    saved_score_files = []
     
+    # 准备numpy版本的mask用于diffuser.reverse
     diffuse_mask = ((1 - sample_feats['fixed_mask']) * sample_feats['res_mask']).detach().cpu().numpy()
     fixed_mask_np = (sample_feats['fixed_mask'] * sample_feats['res_mask']).detach().cpu().numpy()
+    diffuse_mask_np = diffuse_mask  # 保持引用一致性
     t_placeholder = torch.ones(batch_size, device=device)
 
     embed_self_conditioning = (
@@ -300,36 +301,73 @@ def direct_denoising(
             all_rot_scores.append({'t': float(t), 'score': du.move_to_np(rot_score)})
             all_trans_scores.append({'t': float(t), 'score': du.move_to_np(trans_score)})
 
+            # 保存每步的分数到文件
+            if SAVE_STEPWISE_SCORES and output_dir is not None and output_prefix is not None:
+                step_rot_path = os.path.join(output_dir, f'{output_prefix}_step{step_idx:03d}_rot_score.npy')
+                step_trans_path = os.path.join(output_dir, f'{output_prefix}_step{step_idx:03d}_trans_score.npy')
+                
+                rot_score_np = du.move_to_np(rot_score)
+                trans_score_np = du.move_to_np(trans_score)
+                
+                np.save(step_rot_path, rot_score_np)
+                np.save(step_trans_path, trans_score_np)
+                
+                saved_score_files.append({
+                    'step': step_idx,
+                    't': float(t),
+                    'rot_score_path': step_rot_path,
+                    'trans_score_path': step_trans_path,
+                })
+                
+                if step_idx == 0 or step_idx == len(denoising_steps) - 1:
+                    print(f"  步骤 {step_idx}: t={t:.4f}, 已保存分数")
+
             # 如果是最后一步，保存score
             if step_idx == len(denoising_steps) - 1:
-                final_rot_score = du.move_to_np(rot_score).copy()
-                final_trans_score = du.move_to_np(trans_score).copy()
+                final_rot_score = du.move_to_np(rot_score)
+                final_trans_score = du.move_to_np(trans_score)
 
             # 执行去噪步骤
             if t > min_t:
-                current_rigid = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
+                # 转换为numpy数组进行计算
+                rot_score_np = du.move_to_np(rot_score)
+                trans_score_np = du.move_to_np(trans_score)
                 
-                rigids_t = diffuser.reverse(
-                    rigid_t=current_rigid,
-                    rot_score=du.move_to_np(rot_score),
-                    trans_score=du.move_to_np(trans_score),
+                perturb_rot_score = diffuse_mask[..., None] * rot_score_np
+                perturb_trans_score = diffuse_mask[..., None] * trans_score_np
+
+                rigids_t = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
+                if noise_scale > 0:
+                    gt_rot_score, gt_trans_score = diffuser.score(
+                        rigids_t, sample_feats['t'], use_torch=False
+                    )
+                    perturb_rot_score += noise_scale * gt_rot_score
+                    perturb_trans_score += noise_scale * gt_trans_score
+
+                # diffuser.reverse需要numpy数组和Python标量
+                rigids_t_next = diffuser.reverse(
+                    rigid_t=rigids_t,
+                    rot_score=perturb_rot_score,
+                    trans_score=perturb_trans_score,
                     diffuse_mask=diffuse_mask,
                     t=float(t),
-                    dt=dt,
+                    dt=float(dt),
                     center=True,
-                    noise_scale=noise_scale,
+                    noise_scale=0.0,
                 )
                 
-                # 确保结果移回GPU
-                rigids_t_tensor = rigids_t.to_tensor_7().to(device)
-                sample_feats['rigids_t'] = rigids_t_tensor
-                
+                # 确保结果移回GPU，并保持批次维度
+                rigids_t_tensor = rigids_t_next.to_tensor_7()
+                if rigids_t_tensor.ndim == 2:
+                    rigids_t_tensor = rigids_t_tensor.unsqueeze(0)
+                sample_feats['rigids_t'] = rigids_t_tensor.to(device)
+
                 if embed_self_conditioning:
                     sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
             else:
                 rigids_t = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
 
-    print(f"去噪完成！")
+    print(f"去噪完成！共保存 {len(saved_score_files)} 步的分数")
     
     return {
         'final_rigids': rigids_t,
@@ -338,15 +376,20 @@ def direct_denoising(
         'final_rot_score': final_rot_score,
         'final_trans_score': final_trans_score,
         'fixed_mask': fixed_mask_np,
-        'diffuse_mask': diffuse_mask,
+        'diffuse_mask': diffuse_mask_np,
+        'saved_score_files': saved_score_files,
     }
+
 
 
 def main():
     print("=" * 80)
-    print("直接去噪版Score预测器")
+    print("逐步去噪分析器")
     print("=" * 80)
-    print("功能: 直接对原始PDB结构进行去噪，跳过前向加噪过程")
+    print("功能:")
+    print("  1. 直接对原始PDB结构进行去噪")
+    print("  2. 每一步去噪后保存旋转分数和平移分数")
+    print("  3. 去噪结束后自动分析所有分数")
     
     # 加载配置
     conf = OmegaConf.load(CONF_PATH)
@@ -415,7 +458,7 @@ def main():
     output_prefix = f'{pdb_name}_{CHAIN_ID}'
     
     print(f"\n{'='*80}")
-    print("开始直接去噪过程")
+    print("开始逐步去噪过程")
     print(f"{'='*80}")
     print(f"去噪参数:")
     print(f"  步数: {NUM_DENOISING_STEPS}")
@@ -423,8 +466,8 @@ def main():
     print(f"  噪声缩放: {NOISE_SCALE}")
     print(f"  自条件: {ENABLE_SELF_CONDITIONING}")
     
-    # 执行直接去噪
-    denoising_result = direct_denoising(
+    # 执行逐步去噪
+    denoising_result = stepwise_denoising(
         model=model,
         diffuser=diffuser,
         original_rigids=rigids_0,
@@ -439,6 +482,8 @@ def main():
         device=device,
         noise_scale=NOISE_SCALE,
         enable_self_conditioning=ENABLE_SELF_CONDITIONING,
+        output_dir=OUTPUT_DIR,
+        output_prefix=output_prefix,
     )
     
     # 转换为PDB并保存
@@ -461,55 +506,53 @@ def main():
             print("TM-score计算失败")
             tm_score = 0.0
         
-        # 保存最终分数
-        if SAVE_SCORES and denoising_result['final_rot_score'] is not None:
-            rot_score_path = os.path.join(OUTPUT_DIR, f'{output_prefix}_rot_score.npy')
-            trans_score_path = os.path.join(OUTPUT_DIR, f'{output_prefix}_trans_score.npy')
-            np.save(rot_score_path, denoising_result['final_rot_score'])
-            np.save(trans_score_path, denoising_result['final_trans_score'])
-            print(f"最终分数已保存:")
-            print(f"  旋转分数: {rot_score_path}")
-            print(f"  平移分数: {trans_score_path}")
-        
         # 保存详细结果摘要
-        summary_path = os.path.join(OUTPUT_DIR, f'{pdb_name}_denoising_summary.txt')
+        summary_path = os.path.join(OUTPUT_DIR, f'{output_prefix}_stepwise_denoising_summary.txt')
         with open(summary_path, 'w') as f:
-            f.write(f"直接去噪结果摘要\n")
+            f.write(f"逐步去噪结果摘要\n")
             f.write(f"{'='*60}\n\n")
             f.write(f"输入PDB: {PDB_PATH}\n")
             f.write(f"链ID: {CHAIN_ID}\n")
             f.write(f"残基数: {num_res}\n")
-            f.write(f"去噪步数: {NUM_DENOISING_STEPS}\n")
-            f.write(f"时间范围: {MIN_T} -> {MAX_T}\n")
-            f.write(f"噪声缩放: {NOISE_SCALE}\n\n")
+            f.write(f"输出目录: {OUTPUT_DIR}\n\n")
             
-            f.write(f"结果:\n")
-            f.write(f"  去噪后PDB: {output_pdb}\n")
-            f.write(f"  TM-score: {tm_score:.4f}\n\n")
+            f.write(f"去噪参数:\n")
+            f.write(f"  步数: {NUM_DENOISING_STEPS}\n")
+            f.write(f"  时间范围: {MIN_T} -> {MAX_T}\n")
+            f.write(f"  噪声缩放: {NOISE_SCALE}\n")
+            f.write(f"  自条件: {ENABLE_SELF_CONDITIONING}\n\n")
             
-            if denoising_result['final_rot_score'] is not None:
-                f.write(f"最终Score信息:\n")
-                f.write(f"  旋转Score shape: {denoising_result['final_rot_score'].shape}\n")
-                f.write(f"  平移Score shape: {denoising_result['final_trans_score'].shape}\n")
-                f.write(f"  旋转Score统计: mean={np.mean(denoising_result['final_rot_score']):.6f}, "
-                       f"std={np.std(denoising_result['final_rot_score']):.6f}\n")
-                f.write(f"  平移Score统计: mean={np.mean(denoising_result['final_trans_score']):.6f}, "
-                       f"std={np.std(denoising_result['final_trans_score']):.6f}\n")
+            f.write(f"TM-score (去噪后 vs 原始): {tm_score:.4f}\n\n")
+            
+            f.write(f"保存的分数文件:\n")
+            f.write(f"{'='*60}\n")
+            for file_info in denoising_result['saved_score_files']:
+                f.write(f"步骤 {file_info['step']:03d} (t={file_info['t']:.4f}):\n")
+                f.write(f"  旋转分数: {os.path.basename(file_info['rot_score_path'])}\n")
+                f.write(f"  平移分数: {os.path.basename(file_info['trans_score_path'])}\n")
         
         print(f"\n详细摘要已保存: {summary_path}")
         
     except Exception as e:
         print(f"生成去噪结构失败: {e}")
+        traceback.print_exc()
         return
     
+    # 运行分数距离分析
     print(f"\n{'='*80}")
-    print("直接去噪完成！")
+    print("准备运行分数距离分析...")
+    print(f"{'='*80}")
+    
+    print(f"\n{'='*80}")
+    print("逐步去噪完成！")
     print(f"{'='*80}")
     print(f"📁 输出目录: {OUTPUT_DIR}")
     print(f"📄 去噪后PDB: {os.path.basename(output_pdb)}")
     print(f"📊 TM-score: {tm_score:.4f}")
-    print(f"💾 分数文件: {pdb_name}_final_rot_score.npy, {pdb_name}_final_trans_score.npy")
-    print(f"📋 摘要文件: {pdb_name}_denoising_summary.txt")
+    print(f"💾 共保存 {len(denoising_result['saved_score_files'])} 步的分数文件")
+    print(f"📋 摘要文件: {os.path.basename(summary_path)}")
+    print(f"\n提示: 要分析保存的分数，请运行score_distance_analyzer.py")
+    print(f"      并将INPUT_DIR设置为: {OUTPUT_DIR}")
     print(f"{'='*80}")
 
 

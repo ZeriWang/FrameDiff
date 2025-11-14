@@ -39,7 +39,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 
 # 输入参数
-PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '4AKE.pdb')
+PDB_PATH = str(PROJECT_ROOT / 'test' / 'pdb_dir' / '1AKE.pdb')
 CHAIN_ID = 'B'
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_adaptive_denoising')
 WEIGHTS_PATH = str(PROJECT_ROOT / 'weights' / 'best_weights.pth')
@@ -48,13 +48,13 @@ CONF_PATH = str(PROJECT_ROOT / 'config' / 'base.yaml')
 # 自适应去噪参数
 MIN_T = 0.01                 # 固定最小时间步
 MAX_T = 0.05                 # 固定最大时间步
-NOISE_SCALE = 0.01            # 噪声缩放因子
+NOISE_SCALE = 0              # 噪声缩放因子
 ENABLE_SELF_CONDITIONING = True  # 启用自条件
 SAVE_SCORES = True           # 保存最终分数
 
 # 停止条件阈值
-ROT_SCORE_THRESHOLD = 0.01   # 旋转分数阈值
-TRANS_SCORE_THRESHOLD = 0.01 # 平移分数阈值
+ROT_SCORE_THRESHOLD = 0.1    # 旋转分数阈值
+TRANS_SCORE_THRESHOLD = 0.1  # 平移分数阈值
 MAX_ITERATIONS = 10000       # 最大迭代次数(防止无限循环)
 CHECK_INTERVAL = 10          # 每多少步检查一次停止条件
 

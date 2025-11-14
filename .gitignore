@@ -192,3 +192,4 @@ test/score_analysis_output/
 test/output_dir_adaptive_denoising/
 test/parameter_sweep_results/
 test/parameter_group_analysis_results/
+test/output_dir_stepwise_denoising/
