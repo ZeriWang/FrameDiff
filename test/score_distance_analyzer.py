@@ -10,6 +10,10 @@ Score距离分析器
 """
 
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import numpy as np
 from pathlib import Path
 from scipy.spatial.distance import cosine, euclidean
@@ -29,6 +33,217 @@ PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 # 输入参数
 INPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'score_analysis_output')
+PDB_DIR = str(PROJECT_ROOT / 'test' / 'pdb_dir')
+TMALIGN_BIN = os.environ.get('TMALIGN_BIN', 'TM-align')
+REFERENCE_PREFIX = os.environ.get('REFERENCE_PREFIX')
+
+
+def extract_structure_prefix(filename):
+    """Infer structure prefix from score filename."""
+    base = Path(filename).name
+    if base.endswith('.npy'):
+        base = base[:-4]
+    for suffix in ('_rot_score', '_trans_score'):
+        if base.endswith(suffix):
+            return base[:-len(suffix)]
+    raise ValueError(f"无法从文件名 {filename} 中解析前缀")
+
+
+def candidate_structure_basenames(prefix):
+    """Generate ordered candidate basenames for locating the corresponding PDB."""
+    candidates = [prefix]
+    if '_step' in prefix:
+        candidates.append(prefix.split('_step')[0])
+    if '_denoised' in prefix:
+        candidates.append(prefix.split('_denoised')[0])
+    if '_' in prefix:
+        candidates.append(prefix.rsplit('_', 1)[0])
+    candidates.append(prefix.split('_')[0])
+    seen = set()
+    ordered = []
+    for cand in candidates:
+        if cand and cand not in seen:
+            seen.add(cand)
+            ordered.append(cand)
+    return ordered
+
+
+def resolve_structure_path(prefix, search_dirs):
+    """Locate a PDB file that matches the provided prefix."""
+    candidate_bases = candidate_structure_basenames(prefix)
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for candidate in candidate_bases:
+            exact = directory / f"{candidate}.pdb"
+            if exact.exists():
+                return str(exact)
+        for candidate in candidate_bases:
+            matches = sorted(directory.glob(f"{candidate}*.pdb"))
+            if matches:
+                return str(matches[0])
+    raise FileNotFoundError(f"在 {', '.join(str(d) for d in search_dirs)} 中找不到 {prefix} 对应的PDB文件")
+
+
+def locate_tmalign_binary(binary_hint):
+    """Resolve TM-align executable path."""
+    candidates = [binary_hint, TMALIGN_BIN, 'TM-align']
+    for cand in candidates:
+        if not cand:
+            continue
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+        resolved = shutil.which(cand)
+        if resolved:
+            return resolved
+    raise FileNotFoundError("未找到 TM-align 可执行文件，请设置 TMALIGN_BIN 环境变量或将其加入PATH")
+
+
+def parse_tmalign_transform(stdout):
+    """Parse rotation matrix and translation vector from TM-align output."""
+    rotation = np.zeros((3, 3), dtype=np.float64)
+    translation = np.zeros(3, dtype=np.float64)
+    rot_entries = {}
+    trans_entries = {}
+    rot_pattern = re.compile(r"m\((\d),(\d)\)=\s*([-+Ee0-9\.]+)")
+    trans_pattern = re.compile(r"t\((\d)\)=\s*([-+Ee0-9\.]+)")
+    for line in stdout.splitlines():
+        for i_str, j_str, value in rot_pattern.findall(line):
+            rot_entries[(int(i_str) - 1, int(j_str) - 1)] = float(value)
+        for idx_str, value in trans_pattern.findall(line):
+            trans_entries[int(idx_str) - 1] = float(value)
+    if len(rot_entries) != 9 or len(trans_entries) != 3:
+        # 尝试解析新版TM-align在 -m 输出中的矩阵表格格式
+        table_pattern = re.compile(r"^(\d+)\s+([-+Ee0-9\.]+)\s+([-+Ee0-9\.]+)\s+([-+Ee0-9\.]+)\s+([-+Ee0-9\.]+)")
+        table_rotation = np.zeros((3, 3), dtype=np.float64)
+        table_translation = np.zeros(3, dtype=np.float64)
+        table_counts = 0
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith('-') or line.startswith('m '):
+                continue
+            match = table_pattern.match(line)
+            if not match:
+                continue
+            idx = int(match.group(1))
+            if idx < 0 or idx > 2:
+                continue
+            table_translation[idx] = float(match.group(2))
+            table_rotation[idx, 0] = float(match.group(3))
+            table_rotation[idx, 1] = float(match.group(4))
+            table_rotation[idx, 2] = float(match.group(5))
+            table_counts += 1
+        if table_counts == 3:
+            rotation = table_rotation
+            translation = table_translation
+            rot_entries = {(i, j): rotation[i, j] for i in range(3) for j in range(3)}
+            trans_entries = {i: translation[i] for i in range(3)}
+        else:
+            snippet = "\n".join(stdout.splitlines()[:40])
+            raise ValueError("无法从 TM-align 输出中解析旋转矩阵\n" + snippet)
+
+    if len(trans_entries) != 3:
+        snippet = "\n".join(stdout.splitlines()[:40])
+        raise ValueError("无法从 TM-align 输出中解析平移向量\n" + snippet)
+    for (i, j), value in rot_entries.items():
+        rotation[i, j] = value
+    for idx, value in trans_entries.items():
+        translation[idx] = value
+    return rotation, translation
+
+
+def run_tmalign_alignment(tmalign_bin, reference_pdb, target_pdb):
+    """Execute TM-align and return rigid transform aligning target to reference."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='_tmalign.txt') as tmp_file:
+        tmp_path = tmp_file.name
+    try:
+        try:
+            result = subprocess.run(
+                [tmalign_bin, reference_pdb, target_pdb, '-m', tmp_path],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"TM-align 执行失败: {exc.stderr or exc.stdout}") from exc
+
+        if os.path.exists(tmp_path):
+            with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as fh:
+                transform_text = fh.read()
+        else:
+            transform_text = ''
+
+        if not transform_text.strip():
+            transform_text = result.stdout
+
+        return parse_tmalign_transform(transform_text)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def align_structures_for_scores(scores, search_dirs, tmalign_bin=None, reference_prefix=None):
+    """Align structures for all prefixes and return rigid transforms."""
+    prefixes = sorted({entry['prefix'] for entries in scores.values() for entry in entries})
+    if not prefixes:
+        return {}
+    ref_prefix = reference_prefix or REFERENCE_PREFIX or prefixes[0]
+    if ref_prefix not in prefixes:
+        raise ValueError(f"参考前缀 {ref_prefix} 不在可用前缀列表 {prefixes} 中")
+    directories = [Path(d) for d in search_dirs if d and Path(d).exists()]
+    if not directories:
+        raise FileNotFoundError("未找到任何可用的结构目录用于对齐")
+    structure_paths = {prefix: resolve_structure_path(prefix, directories) for prefix in prefixes}
+    transforms = {}
+    transforms[ref_prefix] = {
+        'rotation': np.eye(3, dtype=np.float64),
+        'translation': np.zeros(3, dtype=np.float64),
+        'pdb_path': structure_paths[ref_prefix],
+    }
+    if len(prefixes) == 1:
+        print(f"仅检测到一个前缀 {ref_prefix}，使用其自身坐标系")
+        return transforms
+    tmalign_exec = locate_tmalign_binary(tmalign_bin or TMALIGN_BIN)
+    print(f"参考结构: {ref_prefix} -> {structure_paths[ref_prefix]}")
+    for prefix in prefixes:
+        if prefix == ref_prefix:
+            continue
+        print(f"使用 TM-align 将 {prefix} 对齐至 {ref_prefix}...")
+        rotation, translation = run_tmalign_alignment(tmalign_exec, structure_paths[ref_prefix], structure_paths[prefix])
+        transforms[prefix] = {
+            'rotation': rotation,
+            'translation': translation,
+            'pdb_path': structure_paths[prefix],
+        }
+    return transforms
+
+
+def apply_rigid_transform(score_array, rotation, translation):
+    """Apply rigid transform (rotation + translation) to score array."""
+    data = np.asarray(score_array, dtype=np.float64)
+    if data.ndim < 2 or data.shape[-1] != 3:
+        raise ValueError("score 数组最后一个维度必须为3以应用刚体变换")
+    original_shape = data.shape
+    flattened = data.reshape(-1, 3)
+    transformed = flattened @ rotation.T + translation.reshape(1, 3)
+    transformed = transformed.reshape(original_shape)
+    return transformed.astype(score_array.dtype)
+
+
+def transform_scores_with_alignment(scores, transforms):
+    """Apply precomputed rigid transforms to every score entry."""
+    if not transforms:
+        return
+    for score_type, entries in scores.items():
+        for entry in entries:
+            prefix = entry['prefix']
+            if prefix not in transforms:
+                raise KeyError(f"未找到 {prefix} 的刚体变换")
+            transform = transforms[prefix]
+            entry['data'] = apply_rigid_transform(entry['data'], transform['rotation'], transform['translation'])
+    print("所有score已根据对齐结果完成刚体变换")
 
 
 def load_score_pairs(input_dir, prefix=None):
@@ -60,7 +275,8 @@ def load_score_pairs(input_dir, prefix=None):
     for f in rot_files:
         path = os.path.join(input_dir, f)
         score = np.load(path)
-        rot_scores.append({'filename': f, 'data': score})
+        prefix = extract_structure_prefix(f)
+        rot_scores.append({'filename': f, 'data': score, 'prefix': prefix})
         print(f"  加载: {f}, shape: {score.shape}")
     
     # 加载trans_score
@@ -68,7 +284,8 @@ def load_score_pairs(input_dir, prefix=None):
     for f in trans_files:
         path = os.path.join(input_dir, f)
         score = np.load(path)
-        trans_scores.append({'filename': f, 'data': score})
+        prefix = extract_structure_prefix(f)
+        trans_scores.append({'filename': f, 'data': score, 'prefix': prefix})
         print(f"  加载: {f}, shape: {score.shape}")
     
     scores['rot'] = rot_scores
@@ -651,6 +868,15 @@ def main():
     print(f"\n正在加载score文件...")
     print(f"输入目录: {INPUT_DIR}")
     scores = load_score_pairs(INPUT_DIR, prefix=None)
+
+    # 进行结构对齐并对score应用相同的刚体变换
+    structure_dirs = []
+    if PDB_DIR:
+        structure_dirs.append(Path(PDB_DIR))
+    structure_dirs.append(Path(INPUT_DIR))
+    print("\n准备对齐对应的蛋白质结构，并同步变换score...")
+    transforms = align_structures_for_scores(scores, structure_dirs)
+    transform_scores_with_alignment(scores, transforms)
     
     if len(scores['rot']) < 2 or len(scores['trans']) < 2:
         print("\n警告: 需要至少2个rot_score文件和2个trans_score文件进行分析")
