@@ -31,11 +31,13 @@ plt.rcParams['font.family'] = 'DejaVu Sans'  # Use English-friendly font
 PROJECT_ROOT = Path(__file__).parent.parent.absolute()
 
 # 输入参数
-INPUT_DIR = str(PROJECT_ROOT / 'test' / 'output_dir_direct_denoising')
+INPUT_DIR = str(PROJECT_ROOT / 'test' / 'test_modified')
 OUTPUT_DIR = str(PROJECT_ROOT / 'test' / 'score_analysis_output')
 PDB_DIR = str(PROJECT_ROOT / 'test' / 'pdb_dir')
 TMALIGN_BIN = os.environ.get('TMALIGN_BIN', 'TM-align')
 REFERENCE_PREFIX = os.environ.get('REFERENCE_PREFIX')
+APPLY_TRANSLATION_TO_SCORES = os.environ.get('APPLY_TRANSLATION_TO_SCORES', '0').lower() in {'1', 'true', 'yes'}
+ALIGN_ROTATION_SCORES = os.environ.get('ALIGN_ROTATION_SCORES', '0').lower() in {'1', 'true', 'yes'}
 
 
 def extract_structure_prefix(filename):
@@ -152,14 +154,14 @@ def parse_tmalign_transform(stdout):
     return rotation, translation
 
 
-def run_tmalign_alignment(tmalign_bin, reference_pdb, target_pdb):
-    """Execute TM-align and return rigid transform aligning target to reference."""
+def run_tmalign_alignment(tmalign_bin, target_pdb, reference_pdb):
+    """Execute TM-align and return rigid transform mapping target onto reference."""
     with tempfile.NamedTemporaryFile(delete=False, suffix='_tmalign.txt') as tmp_file:
         tmp_path = tmp_file.name
     try:
         try:
             result = subprocess.run(
-                [tmalign_bin, reference_pdb, target_pdb, '-m', tmp_path],
+                [tmalign_bin, target_pdb, reference_pdb, '-m', tmp_path],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -211,7 +213,11 @@ def align_structures_for_scores(scores, search_dirs, tmalign_bin=None, reference
         if prefix == ref_prefix:
             continue
         print(f"使用 TM-align 将 {prefix} 对齐至 {ref_prefix}...")
-        rotation, translation = run_tmalign_alignment(tmalign_exec, structure_paths[ref_prefix], structure_paths[prefix])
+        rotation, translation = run_tmalign_alignment(
+            tmalign_exec,
+            structure_paths[prefix],
+            structure_paths[ref_prefix],
+        )
         transforms[prefix] = {
             'rotation': rotation,
             'translation': translation,
@@ -220,14 +226,18 @@ def align_structures_for_scores(scores, search_dirs, tmalign_bin=None, reference
     return transforms
 
 
-def apply_rigid_transform(score_array, rotation, translation):
-    """Apply rigid transform (rotation + translation) to score array."""
+def apply_rigid_transform(score_array, rotation, translation, apply_rotation=True, apply_translation=False):
+    """Apply rigid transform to score array."""
     data = np.asarray(score_array, dtype=np.float64)
     if data.ndim < 2 or data.shape[-1] != 3:
         raise ValueError("score 数组最后一个维度必须为3以应用刚体变换")
     original_shape = data.shape
     flattened = data.reshape(-1, 3)
-    transformed = flattened @ rotation.T + translation.reshape(1, 3)
+    transformed = flattened
+    if apply_rotation:
+        transformed = transformed @ rotation.T
+    if apply_translation:
+        transformed = transformed + translation.reshape(1, 3)
     transformed = transformed.reshape(original_shape)
     return transformed.astype(score_array.dtype)
 
@@ -242,7 +252,17 @@ def transform_scores_with_alignment(scores, transforms):
             if prefix not in transforms:
                 raise KeyError(f"未找到 {prefix} 的刚体变换")
             transform = transforms[prefix]
-            entry['data'] = apply_rigid_transform(entry['data'], transform['rotation'], transform['translation'])
+            should_rotate = ALIGN_ROTATION_SCORES if score_type == 'rot' else True
+            should_translate = (score_type == 'trans') and APPLY_TRANSLATION_TO_SCORES
+            if not should_rotate and not should_translate:
+                continue
+            entry['data'] = apply_rigid_transform(
+                entry['data'],
+                transform['rotation'],
+                transform['translation'],
+                apply_rotation=should_rotate,
+                apply_translation=should_translate,
+            )
     print("所有score已根据对齐结果完成刚体变换")
 
 
@@ -870,10 +890,9 @@ def main():
     scores = load_score_pairs(INPUT_DIR, prefix=None)
 
     # 进行结构对齐并对score应用相同的刚体变换
-    structure_dirs = []
+    structure_dirs = [Path(INPUT_DIR)]
     if PDB_DIR:
         structure_dirs.append(Path(PDB_DIR))
-    structure_dirs.append(Path(INPUT_DIR))
     print("\n准备对齐对应的蛋白质结构，并同步变换score...")
     transforms = align_structures_for_scores(scores, structure_dirs)
     transform_scores_with_alignment(scores, transforms)
