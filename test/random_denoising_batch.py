@@ -16,6 +16,8 @@ import os
 import random
 import re
 import subprocess
+import threading
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -154,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-denoising-steps",
         type=int,
-        default=10,
+        default=5,
         help="直接去噪步数",
     )
     parser.add_argument(
@@ -189,8 +191,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--denoise-workers",
         type=int,
-        default=1,
-        help="同时在GPU上运行的去噪任务数",
+        default=0,
+        help="同时在GPU上运行的去噪任务数 (0 表示自动与可用GPU数量一致)",
+    )
+    parser.add_argument(
+        "--device-ids",
+        type=str,
+        default=None,
+        help="逗号分隔的GPU编号列表 (默认使用所有可用GPU)",
     )
     parser.add_argument(
         "--device",
@@ -237,13 +245,19 @@ def sample_pdb_files(source_dir: Path, sample_size: int, seed: int) -> List[Path
     return rng.sample(all_pdbs, actual_size)
 
 
-def initialize_model(config_path: Path, weights_path: Path, device: torch.device):
+def load_model_blueprint(config_path: Path, weights_path: Path):
     conf = OmegaConf.load(config_path)
-    diffuser = se3_diffuser.SE3Diffuser(conf.diffuser)
-    model = score_network.ScoreNetwork(conf.model, diffuser)
-    checkpoint = torch.load(weights_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
     state_dict = checkpoint.get("model", checkpoint)
     state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    conf_container = OmegaConf.to_container(conf, resolve=True)
+    return conf_container, state_dict
+
+
+def build_model_from_blueprint(conf_container, state_dict, device: torch.device):
+    conf = OmegaConf.create(copy.deepcopy(conf_container))
+    diffuser = se3_diffuser.SE3Diffuser(conf.diffuser)
+    model = score_network.ScoreNetwork(conf.model, diffuser)
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
@@ -583,7 +597,7 @@ def render_report(
     lines.append(f"- 实际样本数: {len(samples)}")
     lines.append(f"- 链 ID: {args.chain_id}")
     lines.append(f"- 去噪步数: {args.num_denoising_steps}")
-    lines.append(f"- 时间范围: {args.min_t} -> {args.max_t}")
+    lines.append(f"- 时间范围: {args.max_t} -> {args.min_t}")
     lines.append(f"- 噪声缩放: {args.noise_scale}")
     lines.append(f"- 自条件: {not args.disable_self_conditioning}")
     lines.append("")
@@ -642,47 +656,98 @@ def main():
 
     if args.device and args.device not in {"cpu", "cuda"}:
         raise ValueError("device 只能是 'cpu' 或 'cuda'")
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    if device.type != 'cuda':
-        raise RuntimeError("当前版本要求 CUDA 设备，请在GPU环境下运行或显式指定 --device cuda")
-    print(f"使用设备: {device}")
+    if args.device == "cpu":
+        raise RuntimeError("当前版本仅支持 CUDA 运行，请在GPU环境下执行或省略 --device")
+
+    gpu_count = torch.cuda.device_count()
+    if gpu_count == 0:
+        raise RuntimeError("当前版本要求 CUDA 设备，但未检测到可用GPU")
+
+    if args.device_ids:
+        requested_ids = [int(x.strip()) for x in args.device_ids.split(',') if x.strip()]
+    else:
+        requested_ids = list(range(gpu_count))
+
+    invalid_ids = [gid for gid in requested_ids if gid < 0 or gid >= gpu_count]
+    if invalid_ids:
+        raise ValueError(f"无效的GPU编号: {invalid_ids}，可用范围为 0~{gpu_count-1}")
+
+    denoise_devices = [torch.device(f'cuda:{gid}') for gid in requested_ids]
+    if not denoise_devices:
+        raise RuntimeError("未选择任何GPU用于去噪任务")
+
+    requested_workers = args.denoise_workers if args.denoise_workers > 0 else len(denoise_devices)
+    worker_count = min(requested_workers, len(denoise_devices))
+    worker_devices = denoise_devices[:worker_count]
+    primary_device = worker_devices[0]
+
+    print(f"使用GPU: {[str(dev) for dev in worker_devices]}")
 
     enable_self_conditioning = not args.disable_self_conditioning
 
-    print("初始化模型...")
-    model, diffuser = initialize_model(args.config_path, args.weights_path, device)
+    print("加载模型配置与权重...")
+    conf_container, state_dict = load_model_blueprint(args.config_path, args.weights_path)
+    model_cache: Dict[str, Tuple[score_network.ScoreNetwork, se3_diffuser.SE3Diffuser]] = {}
+    cache_lock = threading.Lock()
+
+    def get_or_create_model(device_obj: torch.device):
+        key = str(device_obj)
+        with cache_lock:
+            if key not in model_cache:
+                model_obj, diffuser_obj = build_model_from_blueprint(conf_container, state_dict, device_obj)
+                model_cache[key] = (model_obj, diffuser_obj)
+        return model_cache[key]
 
     pdb_paths = sample_pdb_files(args.source_dir, args.sample_size, args.seed)
     print(f"抽样到 {len(pdb_paths)} 个PDB文件")
 
     samples: List[SampleResult] = []
 
-    def process_single(idx_path):
-        idx, path = idx_path
-        print(f"[{idx}/{len(pdb_paths)}] 处理 {path}")
-        return run_denoising_for_sample(
-            model=model,
-            diffuser=diffuser,
-            device=device,
-            pdb_path=path,
-            chain_id=args.chain_id,
-            output_dir=scores_dir,
-            num_steps=args.num_denoising_steps,
-            min_t=args.min_t,
-            max_t=args.max_t,
-            noise_scale=args.noise_scale,
-            enable_self_conditioning=enable_self_conditioning,
-        )
+    device_task_map: Dict[torch.device, List[Tuple[int, Path]]] = {dev: [] for dev in worker_devices}
+    device_cycle = itertools.cycle(worker_devices)
+    for idx, path in enumerate(pdb_paths, start=1):
+        assigned_device = next(device_cycle)
+        device_task_map[assigned_device].append((idx, path))
 
-    indexed_paths = list(enumerate(pdb_paths, start=1))
-    if args.denoise_workers > 1:
-        with ThreadPoolExecutor(max_workers=args.denoise_workers) as executor:
-            future_map = {executor.submit(process_single, item): item[1] for item in indexed_paths}
-            for future in as_completed(future_map):
-                samples.append(future.result())
+    def process_device_queue(device_obj: torch.device, assignments: List[Tuple[int, Path]]):
+        results: List[SampleResult] = []
+        if not assignments:
+            return results
+        model_obj, diffuser_obj = get_or_create_model(device_obj)
+        device_label = device_obj.index if device_obj.index is not None else 0
+        total = len(pdb_paths)
+        for idx, path in assignments:
+            print(f"[GPU {device_label}] [{idx}/{total}] 处理 {path}")
+            result = run_denoising_for_sample(
+                model=model_obj,
+                diffuser=diffuser_obj,
+                device=device_obj,
+                pdb_path=path,
+                chain_id=args.chain_id,
+                output_dir=scores_dir,
+                num_steps=args.num_denoising_steps,
+                min_t=args.min_t,
+                max_t=args.max_t,
+                noise_scale=args.noise_scale,
+                enable_self_conditioning=enable_self_conditioning,
+            )
+            results.append(result)
+        return results
+
+    active_devices = [dev for dev, tasks in device_task_map.items() if tasks]
+    if not active_devices:
+        raise RuntimeError("没有分配任何去噪任务，请检查 sample-size 设置")
+    if len(active_devices) == 1:
+        device_obj = active_devices[0]
+        samples.extend(process_device_queue(device_obj, device_task_map[device_obj]))
     else:
-        for item in indexed_paths:
-            samples.append(process_single(item))
+        with ThreadPoolExecutor(max_workers=len(active_devices)) as executor:
+            futures = {
+                executor.submit(process_device_queue, dev, device_task_map[dev]): dev
+                for dev in active_devices
+            }
+            for future in as_completed(futures):
+                samples.extend(future.result())
 
     samples.sort(key=lambda s: s.name)
 
@@ -694,7 +759,13 @@ def main():
     pair_metrics: List[PairMetrics] = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         future_map = {
-            executor.submit(compute_pair_metrics, args.tm_align_bin, a, b, device): (a.name, b.name)
+            executor.submit(
+                compute_pair_metrics,
+                args.tm_align_bin,
+                a,
+                b,
+                primary_device,
+            ): (a.name, b.name)
             for (a, b) in pairs
         }
         for future in as_completed(future_map):

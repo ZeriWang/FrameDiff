@@ -240,7 +240,7 @@ def direct_denoising(
     """
     print(f"开始直接去噪过程...")
     print(f"  去噪步数: {num_steps}")
-    print(f"  时间范围: {min_t} -> {max_t}")
+    print(f"  时间范围: {max_t} -> {min_t}")
     print(f"  噪声缩放: {noise_scale}")
     
     # 准备输入特征
@@ -419,7 +419,7 @@ def main():
     print(f"{'='*80}")
     print(f"去噪参数:")
     print(f"  步数: {NUM_DENOISING_STEPS}")
-    print(f"  时间范围: {MIN_T} -> {MAX_T}")
+    print(f"  时间范围: {MAX_T} -> {MIN_T}")
     print(f"  噪声缩放: {NOISE_SCALE}")
     print(f"  自条件: {ENABLE_SELF_CONDITIONING}")
     
@@ -480,7 +480,7 @@ def main():
             f.write(f"链ID: {CHAIN_ID}\n")
             f.write(f"残基数: {num_res}\n")
             f.write(f"去噪步数: {NUM_DENOISING_STEPS}\n")
-            f.write(f"时间范围: {MIN_T} -> {MAX_T}\n")
+            f.write(f"时间范围: {MAX_T} -> {MIN_T}\n")
             f.write(f"噪声缩放: {NOISE_SCALE}\n\n")
             
             f.write(f"结果:\n")
