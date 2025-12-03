@@ -150,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=33,
         help="随机种子",
     )
     parser.add_argument(
