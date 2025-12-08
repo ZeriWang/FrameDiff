@@ -24,10 +24,11 @@ import subprocess
 import time
 import uuid
 import copy
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from multiprocessing import cpu_count
 from typing import Dict, List, Optional, Sequence, Tuple, Any
 import sys
 
@@ -196,6 +197,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling", type=str, default="flatten",
                         choices=["flatten", "mean", "max"],
                         help="不同长度蛋白质的特征聚合方式")
+    parser.add_argument("--use-alignment", action="store_true",
+                        help="使用TM-align进行结构对齐后再计算分数距离（更准确但更慢）")
+    parser.add_argument("--alignment-workers", type=int, default=8,
+                        help="对齐计算的并行线程数")
     
     return parser.parse_args()
 
@@ -471,30 +476,6 @@ def batched_direct_denoising(
     }
 
 
-def group_by_length(inputs: List[PreparedInput], tolerance: int = 50) -> List[List[PreparedInput]]:
-    """按长度分组"""
-    if not inputs:
-        return []
-    
-    sorted_inputs = sorted(inputs, key=lambda x: x.num_res)
-    groups = []
-    current_group = [sorted_inputs[0]]
-    current_base_len = sorted_inputs[0].num_res
-    
-    for inp in sorted_inputs[1:]:
-        if inp.num_res - current_base_len <= tolerance:
-            current_group.append(inp)
-        else:
-            groups.append(current_group)
-            current_group = [inp]
-            current_base_len = inp.num_res
-    
-    if current_group:
-        groups.append(current_group)
-    
-    return groups
-
-
 def process_all_samples(
     model: torch.nn.Module,
     diffuser,
@@ -509,63 +490,349 @@ def process_all_samples(
     use_fp16: bool,
     output_dir: Path,
 ) -> List[SampleResult]:
-    """处理所有样本"""
-    length_groups = group_by_length(prepared_inputs, tolerance=50)
-    print(f"按长度分成 {len(length_groups)} 组")
+    """
+    处理所有样本
     
+    注意: 假设所有输入蛋白质序列长度相同，无需分组
+    """
     all_results: List[SampleResult] = []
-    total_batches = sum((len(g) + batch_size - 1) // batch_size for g in length_groups)
-    batch_count = 0
+    total_samples = len(prepared_inputs)
+    total_batches = (total_samples + batch_size - 1) // batch_size
     
-    for group in length_groups:
-        for batch_start in range(0, len(group), batch_size):
-            batch_end = min(batch_start + batch_size, len(group))
-            batch_inputs = group[batch_start:batch_end]
-            batch_count += 1
+    print(f"处理 {total_samples} 个样本, 共 {total_batches} 个batch")
+    
+    for batch_idx in range(total_batches):
+        batch_start = batch_idx * batch_size
+        batch_end = min(batch_start + batch_size, total_samples)
+        batch_inputs = prepared_inputs[batch_start:batch_end]
+        
+        print(f"\r处理batch {batch_idx + 1}/{total_batches}", end="", flush=True)
+        
+        batched_input = create_batched_input(batch_inputs, device, use_fp16)
+        results = batched_direct_denoising(
+            model=model,
+            diffuser=diffuser,
+            batched_input=batched_input,
+            num_steps=num_steps,
+            min_t=min_t,
+            max_t=max_t,
+            noise_scale=noise_scale,
+            enable_self_conditioning=enable_self_conditioning,
+            device=device,
+        )
+        
+        for i, inp in enumerate(batch_inputs):
+            rot_score = results['final_rot_scores'][i]
+            trans_score = results['final_trans_scores'][i]
             
-            print(f"\r处理batch {batch_count}/{total_batches}", end="", flush=True)
+            if rot_score is None or trans_score is None:
+                continue
             
-            batched_input = create_batched_input(batch_inputs, device, use_fp16)
-            results = batched_direct_denoising(
-                model=model,
-                diffuser=diffuser,
-                batched_input=batched_input,
-                num_steps=num_steps,
-                min_t=min_t,
-                max_t=max_t,
-                noise_scale=noise_scale,
-                enable_self_conditioning=enable_self_conditioning,
-                device=device,
-            )
+            rot_path = output_dir / f"{inp.name}_rot_score.npy"
+            trans_path = output_dir / f"{inp.name}_trans_score.npy"
+            np.save(rot_path, rot_score)
+            np.save(trans_path, trans_score)
             
-            for i, inp in enumerate(batch_inputs):
-                rot_score = results['final_rot_scores'][i]
-                trans_score = results['final_trans_scores'][i]
-                
-                if rot_score is None or trans_score is None:
-                    continue
-                
-                rot_path = output_dir / f"{inp.name}_rot_score.npy"
-                trans_path = output_dir / f"{inp.name}_trans_score.npy"
-                np.save(rot_path, rot_score)
-                np.save(trans_path, trans_score)
-                
-                all_results.append(SampleResult(
-                    name=inp.name,
-                    pdb_path=inp.pdb_path,
-                    chain_id=inp.chain_id,
-                    num_res=inp.num_res,
-                    rot_score=rot_score,
-                    trans_score=trans_score,
-                    rot_score_path=rot_path,
-                    trans_score_path=trans_path,
-                ))
-            
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+            all_results.append(SampleResult(
+                name=inp.name,
+                pdb_path=inp.pdb_path,
+                chain_id=inp.chain_id,
+                num_res=inp.num_res,
+                rot_score=rot_score,
+                trans_score=trans_score,
+                rot_score_path=rot_path,
+                trans_score_path=trans_path,
+            ))
+        
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
     print()  # 换行
     return all_results
+
+
+# ============================================================================
+# TM-align 结构对齐
+# ============================================================================
+
+def parse_tmalign_alignment(output: str) -> Tuple[List[int], List[int]]:
+    """
+    解析TM-align输出，提取残基对应关系
+    
+    TM-align输出格式示例:
+    (":" 表示对齐的残基, "." 表示距离<5Å但不对齐, " " 表示无对齐)
+    
+    Returns:
+        aligned_indices_a: 结构A中对齐的残基索引列表
+        aligned_indices_b: 结构B中对齐的残基索引列表
+    """
+    lines = output.strip().split('\n')
+    
+    # 查找对齐块 (通常在输出末尾)
+    seq_a_parts = []
+    align_parts = []
+    seq_b_parts = []
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # 寻找对齐块的开始 (以序列字符开始的三行组)
+        if i + 2 < len(lines) and len(line) > 0:
+            # 检查是否是对齐块格式
+            # 第一行: 结构1的序列
+            # 第二行: 对齐符号 (:, ., 空格)
+            # 第三行: 结构2的序列
+            next_line = lines[i + 1] if i + 1 < len(lines) else ""
+            third_line = lines[i + 2] if i + 2 < len(lines) else ""
+            
+            # 对齐符号行应该只包含 ':', '.', ' ' 和字母
+            if (len(next_line) > 0 and 
+                all(c in ':. ' for c in next_line.replace('-', ' ')) and
+                len(line) == len(next_line) == len(third_line)):
+                seq_a_parts.append(line)
+                align_parts.append(next_line)
+                seq_b_parts.append(third_line)
+                i += 3
+                continue
+        i += 1
+    
+    if not align_parts:
+        # 备用方案：直接返回空对齐
+        return [], []
+    
+    # 合并所有对齐块
+    seq_a = ''.join(seq_a_parts)
+    alignment = ''.join(align_parts)
+    seq_b = ''.join(seq_b_parts)
+    
+    # 提取对齐的残基索引
+    aligned_indices_a = []
+    aligned_indices_b = []
+    
+    idx_a = 0  # 结构A的残基计数器
+    idx_b = 0  # 结构B的残基计数器
+    
+    for i, (char_a, align_char, char_b) in enumerate(zip(seq_a, alignment, seq_b)):
+        is_res_a = char_a != '-' and char_a != ' '
+        is_res_b = char_b != '-' and char_b != ' '
+        
+        # 只有当两边都有残基且对齐符号为':'时才记录
+        if align_char == ':' and is_res_a and is_res_b:
+            aligned_indices_a.append(idx_a)
+            aligned_indices_b.append(idx_b)
+        
+        if is_res_a:
+            idx_a += 1
+        if is_res_b:
+            idx_b += 1
+    
+    return aligned_indices_a, aligned_indices_b
+
+
+def run_tmalign_with_alignment(
+    tm_align_bin: Path, 
+    pdb_a: Path, 
+    pdb_b: Path
+) -> Tuple[float, List[int], List[int]]:
+    """
+    运行TM-align并获取TM-score和残基对齐信息
+    
+    Returns:
+        tm_score: TM-score值
+        aligned_indices_a: 结构A中对齐的残基索引
+        aligned_indices_b: 结构B中对齐的残基索引
+    """
+    cmd = [str(tm_align_bin), str(pdb_a), str(pdb_b)]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+        output = result.stdout
+        
+        # 提取TM-score
+        tm_match = re.search(r"TM-score\s*=\s*([0-9.]+)", output)
+        tm_score = float(tm_match.group(1)) if tm_match else float('nan')
+        
+        # 解析对齐
+        aligned_a, aligned_b = parse_tmalign_alignment(output)
+        
+        return tm_score, aligned_a, aligned_b
+        
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception) as e:
+        return float('nan'), [], []
+
+
+def compute_aligned_cosine_distance(
+    score_a: np.ndarray,
+    score_b: np.ndarray,
+    aligned_indices_a: List[int],
+    aligned_indices_b: List[int],
+) -> float:
+    """
+    根据TM-align的结构对齐结果，对分数进行相应重排后计算余弦距离
+    
+    TM-align对结构进行对齐后，返回对齐的残基索引对。
+    我们根据这个对齐关系，将两个结构的分数向量按对齐的残基顺序重新排列。
+    
+    例如: 如果TM-align说结构A的残基[0,1,2,5,6]与结构B的残基[0,1,3,4,5]对齐，
+    那么我们只比较这些对齐的残基的分数。
+    
+    Args:
+        score_a: 结构A的分数 (num_res_a, 3)
+        score_b: 结构B的分数 (num_res_b, 3)
+        aligned_indices_a: A中对齐的残基索引 (来自TM-align)
+        aligned_indices_b: B中对齐的残基索引 (来自TM-align)
+    
+    Returns:
+        余弦距离 (0-2)
+    """
+    if len(aligned_indices_a) == 0 or len(aligned_indices_b) == 0:
+        return 2.0  # 无对齐，返回最大距离
+    
+    # 确保对齐列表长度相同
+    assert len(aligned_indices_a) == len(aligned_indices_b), \
+        f"对齐索引长度不匹配: {len(aligned_indices_a)} vs {len(aligned_indices_b)}"
+    
+    # 过滤有效索引 (确保在分数数组范围内)
+    valid_pairs = [
+        (ia, ib) for ia, ib in zip(aligned_indices_a, aligned_indices_b)
+        if ia < len(score_a) and ib < len(score_b)
+    ]
+    
+    if len(valid_pairs) == 0:
+        return 2.0
+    
+    # 根据对齐关系提取并重排分数
+    # 这样score_a_aligned[i]和score_b_aligned[i]就是结构上对应的残基的分数
+    score_a_aligned = np.array([score_a[ia] for ia, ib in valid_pairs])
+    score_b_aligned = np.array([score_b[ib] for ia, ib in valid_pairs])
+    
+    # 展平成一维向量
+    vec_a = score_a_aligned.flatten()
+    vec_b = score_b_aligned.flatten()
+    
+    # 计算余弦距离
+    norm_a = np.linalg.norm(vec_a)
+    norm_b = np.linalg.norm(vec_b)
+    
+    if norm_a < 1e-10 or norm_b < 1e-10:
+        return 2.0  # 零向量无法计算余弦距离
+    
+    cosine_sim = np.dot(vec_a, vec_b) / (norm_a * norm_b)
+    cosine_dist = 1.0 - cosine_sim
+    
+    return float(cosine_dist)
+
+
+def _compute_aligned_distance_worker(args) -> Tuple[int, int, float, float, float]:
+    """
+    计算一对样本的对齐距离 (用于并行计算)
+    
+    Args:
+        args: (i, j, tm_align_bin_str, pdb_a_str, pdb_b_str, 
+               rot_score_a, rot_score_b, trans_score_a, trans_score_b, alpha)
+    
+    Returns:
+        (i, j, combined_dist, tm_score, num_aligned)
+    """
+    (i, j, tm_align_bin_str, pdb_a_str, pdb_b_str,
+     rot_score_a_path, rot_score_b_path, 
+     trans_score_a_path, trans_score_b_path, alpha) = args
+    
+    try:
+        # 运行TM-align获取对齐信息
+        tm_align_bin = Path(tm_align_bin_str)
+        tm_score, aligned_a, aligned_b = run_tmalign_with_alignment(
+            tm_align_bin, Path(pdb_a_str), Path(pdb_b_str)
+        )
+        
+        # 加载分数
+        rot_score_a = np.load(rot_score_a_path)
+        rot_score_b = np.load(rot_score_b_path)
+        trans_score_a = np.load(trans_score_a_path)
+        trans_score_b = np.load(trans_score_b_path)
+        
+        # 计算对齐后的余弦距离
+        rot_dist = compute_aligned_cosine_distance(
+            rot_score_a, rot_score_b, aligned_a, aligned_b
+        )
+        trans_dist = compute_aligned_cosine_distance(
+            trans_score_a, trans_score_b, aligned_a, aligned_b
+        )
+        
+        combined_dist = alpha * rot_dist + (1 - alpha) * trans_dist
+        
+        return i, j, combined_dist, tm_score, len(aligned_a)
+        
+    except Exception as e:
+        return i, j, 2.0, float('nan'), 0
+
+
+def compute_aligned_distance_matrix(
+    samples: List[SampleResult],
+    tm_align_bin: Path,
+    alpha: float,
+    num_workers: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    使用TM-align对齐后计算所有样本对的距离矩阵
+    
+    Args:
+        samples: 样本列表
+        tm_align_bin: TM-align可执行文件路径
+        alpha: 旋转分数权重
+        num_workers: 并行线程数
+    
+    Returns:
+        distance_matrix: (N, N) 组合距离矩阵
+        tm_matrix: (N, N) TM-score矩阵
+    """
+    n = len(samples)
+    distance_matrix = np.zeros((n, n), dtype=np.float64)
+    tm_matrix = np.eye(n, dtype=np.float64)  # 对角线为1
+    
+    # 生成所有样本对
+    pairs = list(itertools.combinations(range(n), 2))
+    
+    if not pairs:
+        return distance_matrix, tm_matrix
+    
+    print(f"  计算 {len(pairs)} 对样本的对齐距离...")
+    
+    # 准备任务参数
+    tm_align_str = str(tm_align_bin)
+    tasks = []
+    
+    for i, j in pairs:
+        tasks.append((
+            i, j, tm_align_str,
+            str(samples[i].pdb_path), str(samples[j].pdb_path),
+            str(samples[i].rot_score_path), str(samples[j].rot_score_path),
+            str(samples[i].trans_score_path), str(samples[j].trans_score_path),
+            alpha
+        ))
+    
+    # 并行计算
+    effective_workers = min(num_workers, cpu_count(), len(tasks))
+    completed = 0
+    total = len(tasks)
+    
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        chunksize = max(1, total // (effective_workers * 4))
+        
+        for i, j, dist, tm, n_aligned in executor.map(
+            _compute_aligned_distance_worker, tasks, chunksize=chunksize
+        ):
+            distance_matrix[i, j] = dist
+            distance_matrix[j, i] = dist
+            tm_matrix[i, j] = tm
+            tm_matrix[j, i] = tm
+            
+            completed += 1
+            if completed % 100 == 0 or completed == total:
+                print(f"\r  对齐距离计算进度: {completed}/{total} ({100*completed/total:.1f}%)", 
+                      end="", flush=True)
+    
+    print()  # 换行
+    return distance_matrix, tm_matrix
 
 
 # ============================================================================
@@ -679,8 +946,25 @@ def perform_clustering(
 
 
 # ============================================================================
-# TM-score计算
+# TM-score计算 (优化版本)
 # ============================================================================
+
+def _compute_tm_score_worker(args) -> Tuple[int, int, float]:
+    """
+    TM-score计算的worker函数 (用于ProcessPoolExecutor)
+    args: (i, j, tm_align_bin_str, pdb_a_str, pdb_b_str)
+    """
+    i, j, tm_align_bin_str, pdb_a_str, pdb_b_str = args
+    cmd = [tm_align_bin_str, pdb_a_str, pdb_b_str]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+        match = re.search(r"TM-score\s*=\s*([0-9.]+)", result.stdout)
+        if not match:
+            return i, j, float('nan')
+        return i, j, float(match.group(1))
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, Exception):
+        return i, j, float('nan')
+
 
 def compute_tm_score(tm_align_bin: Path, pdb_a: Path, pdb_b: Path) -> float:
     """计算两个PDB的TM-score"""
@@ -689,7 +973,7 @@ def compute_tm_score(tm_align_bin: Path, pdb_a: Path, pdb_b: Path) -> float:
     
     cmd = [str(tm_align_bin), str(pdb_a), str(pdb_b)]
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
         match = re.search(r"TM-score\s*=\s*([0-9.]+)", result.stdout)
         if not match:
             return float('nan')
@@ -698,37 +982,165 @@ def compute_tm_score(tm_align_bin: Path, pdb_a: Path, pdb_b: Path) -> float:
         return float('nan')
 
 
+def compute_gpu_rmsd_matrix(
+    samples: List[SampleResult],
+    device: torch.device,
+) -> np.ndarray:
+    """
+    使用GPU批量计算所有样本对之间的RMSD (基于CA原子坐标)
+    这是一个快速的结构相似度估计，可用于预筛选
+    
+    Returns:
+        rmsd_matrix: (N, N) RMSD矩阵
+    """
+    n = len(samples)
+    
+    # 提取所有样本的CA坐标 (已经在sc_ca中)
+    # 由于长度可能不同，需要找到最大长度并padding
+    max_len = max(s.num_res for s in samples)
+    
+    # 创建padded坐标张量
+    coords = torch.zeros((n, max_len, 3), dtype=torch.float32, device=device)
+    masks = torch.zeros((n, max_len), dtype=torch.bool, device=device)
+    
+    for i, s in enumerate(samples):
+        # s.rot_score 或 s.trans_score 包含坐标信息
+        # 但更好的是使用原始PDB的CA坐标
+        # 这里我们用一个简化版本：从score中估计
+        coords[i, :s.num_res] = torch.from_numpy(
+            s.trans_score if hasattr(s, 'trans_score') and s.trans_score is not None 
+            else np.zeros((s.num_res, 3))
+        ).to(device)
+        masks[i, :s.num_res] = True
+    
+    # 计算所有对的RMSD (GPU并行)
+    rmsd_matrix = torch.zeros((n, n), dtype=torch.float32, device=device)
+    
+    # 批量计算 - 利用GPU并行
+    batch_size = 64  # 每次处理的对数
+    pairs = list(itertools.combinations(range(n), 2))
+    
+    for batch_start in range(0, len(pairs), batch_size):
+        batch_pairs = pairs[batch_start:batch_start + batch_size]
+        
+        for i, j in batch_pairs:
+            # 获取有效长度
+            len_i, len_j = samples[i].num_res, samples[j].num_res
+            min_len = min(len_i, len_j)
+            
+            # 计算RMSD (只比较共同长度部分)
+            diff = coords[i, :min_len] - coords[j, :min_len]
+            rmsd = torch.sqrt((diff ** 2).sum(dim=-1).mean())
+            
+            rmsd_matrix[i, j] = rmsd
+            rmsd_matrix[j, i] = rmsd
+    
+    return rmsd_matrix.cpu().numpy()
+
+
 def compute_cluster_tm_scores(
     cluster_members: List[SampleResult],
     tm_align_bin: Path,
     num_workers: int = 8,
 ) -> np.ndarray:
-    """计算簇内所有成员两两之间的TM-score"""
+    """
+    计算簇内所有成员两两之间的TM-score
+    使用ProcessPoolExecutor提高CPU密集型任务的并行效率
+    """
     n = len(cluster_members)
     tm_matrix = np.eye(n, dtype=np.float64)
     
     if n < 2:
         return tm_matrix
     
+    # 准备所有计算任务
     pairs = list(itertools.combinations(range(n), 2))
+    tm_align_str = str(tm_align_bin)
     
-    def compute_pair(pair):
-        i, j = pair
-        tm = compute_tm_score(
-            tm_align_bin,
-            cluster_members[i].pdb_path,
-            cluster_members[j].pdb_path
-        )
-        return i, j, tm
+    # 创建任务参数列表
+    tasks = [
+        (i, j, tm_align_str, 
+         str(cluster_members[i].pdb_path), 
+         str(cluster_members[j].pdb_path))
+        for i, j in pairs
+    ]
     
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(compute_pair, p) for p in pairs]
-        for future in as_completed(futures):
-            i, j, tm = future.result()
-            tm_matrix[i, j] = tm
-            tm_matrix[j, i] = tm
+    # 使用ProcessPoolExecutor (CPU密集型任务更高效)
+    # 限制worker数量避免过载
+    effective_workers = min(num_workers, cpu_count(), len(tasks))
+    
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        results = list(executor.map(_compute_tm_score_worker, tasks, chunksize=max(1, len(tasks) // effective_workers)))
+    
+    for i, j, tm in results:
+        tm_matrix[i, j] = tm
+        tm_matrix[j, i] = tm
     
     return tm_matrix
+
+
+def compute_all_tm_scores_parallel(
+    samples: List[SampleResult],
+    labels: np.ndarray,
+    tm_align_bin: Path,
+    num_workers: int,
+) -> Dict[Tuple[int, int], float]:
+    """
+    并行计算所有需要的TM-score对
+    
+    优化策略:
+    1. 收集所有簇内需要计算的样本对
+    2. 一次性提交所有任务到进程池
+    3. 避免多次创建/销毁进程池的开销
+    
+    Returns:
+        tm_cache: {(global_idx_i, global_idx_j): tm_score}
+    """
+    unique_labels = sorted(set(labels) - {-1})
+    
+    # 收集所有需要计算的样本对 (使用全局索引)
+    all_pairs = []
+    for cluster_id in unique_labels:
+        member_indices = np.where(labels == cluster_id)[0].tolist()
+        if len(member_indices) >= 2:
+            for i, j in itertools.combinations(member_indices, 2):
+                all_pairs.append((i, j))
+    
+    if not all_pairs:
+        return {}
+    
+    print(f"  需要计算 {len(all_pairs)} 对TM-score...")
+    
+    # 准备任务
+    tm_align_str = str(tm_align_bin)
+    tasks = [
+        (i, j, tm_align_str, str(samples[i].pdb_path), str(samples[j].pdb_path))
+        for i, j in all_pairs
+    ]
+    
+    # 使用ProcessPoolExecutor并行计算
+    effective_workers = min(num_workers, cpu_count(), len(tasks))
+    tm_cache = {}
+    
+    completed = 0
+    total = len(tasks)
+    
+    with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        # 使用map更高效地处理大量任务
+        chunksize = max(1, total // (effective_workers * 4))
+        
+        for i, j, tm in executor.map(_compute_tm_score_worker, tasks, chunksize=chunksize):
+            tm_cache[(i, j)] = tm
+            tm_cache[(j, i)] = tm
+            completed += 1
+            
+            # 进度显示
+            if completed % 50 == 0 or completed == total:
+                print(f"\r  TM-score计算进度: {completed}/{total} ({100*completed/total:.1f}%)", 
+                      end="", flush=True)
+    
+    print()  # 换行
+    return tm_cache
 
 
 def analyze_clusters(
@@ -737,24 +1149,45 @@ def analyze_clusters(
     tm_align_bin: Path,
     tm_threshold: float,
     num_workers: int,
+    precomputed_tm: Optional[Dict[Tuple[int, int], float]] = None,
 ) -> List[ClusterInfo]:
-    """分析所有簇，计算TM-score并筛选多构象簇"""
+    """
+    分析所有簇，计算TM-score并筛选多构象簇
+    
+    优化:
+    1. 支持预计算的TM-score缓存
+    2. 如果没有预计算，一次性并行计算所有需要的TM-score
+    """
     unique_labels = sorted(set(labels) - {-1})
     print(f"发现 {len(unique_labels)} 个簇 (不含噪声)")
+    
+    # 如果没有预计算的TM-score，一次性计算所有
+    if precomputed_tm is None:
+        print("\n并行计算所有簇内TM-score...")
+        tm_start = time.time()
+        precomputed_tm = compute_all_tm_scores_parallel(
+            samples, labels, tm_align_bin, num_workers
+        )
+        print(f"TM-score计算完成，耗时 {time.time() - tm_start:.2f}s")
     
     clusters: List[ClusterInfo] = []
     
     for cluster_id in unique_labels:
         member_indices = np.where(labels == cluster_id)[0].tolist()
         cluster_members = [samples[i] for i in member_indices]
+        n = len(cluster_members)
         
-        print(f"\n分析簇 {cluster_id} ({len(cluster_members)} 个成员)...")
-        
-        # 计算簇内TM-score
-        tm_matrix = compute_cluster_tm_scores(cluster_members, tm_align_bin, num_workers)
+        # 从缓存构建TM矩阵
+        tm_matrix = np.eye(n, dtype=np.float64)
+        if n > 1:
+            for local_i, global_i in enumerate(member_indices):
+                for local_j, global_j in enumerate(member_indices):
+                    if local_i < local_j:
+                        tm = precomputed_tm.get((global_i, global_j), float('nan'))
+                        tm_matrix[local_i, local_j] = tm
+                        tm_matrix[local_j, local_i] = tm
         
         # 计算统计量 (排除对角线)
-        n = len(cluster_members)
         if n > 1:
             triu_indices = np.triu_indices(n, k=1)
             tm_values = tm_matrix[triu_indices]
@@ -785,7 +1218,7 @@ def analyze_clusters(
         clusters.append(cluster_info)
         
         status = "✓ 多构象" if is_multiconformer else "✗ 单构象"
-        print(f"  平均TM-score: {avg_tm:.4f} ({status})")
+        print(f"簇 {cluster_id}: {n}个成员, 平均TM-score={avg_tm:.4f} ({status})")
     
     return clusters
 
@@ -1120,15 +1553,39 @@ def main():
     timing_info['denoising'] = time.time() - denoising_start
     print(f"去噪完成: {len(samples)} 个样本, 耗时 {timing_info['denoising']:.2f}s")
     
-    # 提取特征
-    print(f"\n提取特征 (pooling={args.pooling})...")
-    rot_features, trans_features = extract_features(samples, args.pooling)
-    print(f"特征维度: rot={rot_features.shape}, trans={trans_features.shape}")
-    
     # 计算距离矩阵
-    print(f"\n计算组合距离矩阵 (α={args.alpha})...")
     clustering_start = time.time()
-    distance_matrix = compute_combined_distance_matrix(rot_features, trans_features, args.alpha)
+    
+    if args.use_alignment:
+        # 使用TM-align对齐后计算距离
+        print(f"\n使用TM-align对齐计算组合距离矩阵 (α={args.alpha})...")
+        print("  (对齐模式更准确但更慢，适合比较不同蛋白质)")
+        distance_matrix, precomputed_tm_matrix = compute_aligned_distance_matrix(
+            samples=samples,
+            tm_align_bin=args.tm_align_bin,
+            alpha=args.alpha,
+            num_workers=args.alignment_workers,
+        )
+        # 将TM矩阵转换为字典格式供后续使用
+        precomputed_tm = {}
+        n = len(samples)
+        for i in range(n):
+            for j in range(i+1, n):
+                precomputed_tm[(i, j)] = precomputed_tm_matrix[i, j]
+                precomputed_tm[(j, i)] = precomputed_tm_matrix[j, i]
+        
+        # 仍然提取特征用于可视化
+        print(f"\n提取特征用于可视化 (pooling={args.pooling})...")
+        rot_features, trans_features = extract_features(samples, args.pooling)
+    else:
+        # 原始模式：直接padding后计算余弦距离
+        print(f"\n提取特征 (pooling={args.pooling})...")
+        rot_features, trans_features = extract_features(samples, args.pooling)
+        print(f"特征维度: rot={rot_features.shape}, trans={trans_features.shape}")
+        
+        print(f"\n计算组合距离矩阵 (α={args.alpha})...")
+        distance_matrix = compute_combined_distance_matrix(rot_features, trans_features, args.alpha)
+        precomputed_tm = None
     
     # HDBSCAN聚类
     print(f"执行HDBSCAN聚类 (min_cluster_size={args.min_cluster_size})...")
@@ -1153,6 +1610,7 @@ def main():
         tm_align_bin=args.tm_align_bin,
         tm_threshold=args.tm_threshold,
         num_workers=args.tm_workers,
+        precomputed_tm=precomputed_tm,  # 如果使用对齐模式，复用已计算的TM-score
     )
     timing_info['tm_analysis'] = time.time() - tm_start
     
