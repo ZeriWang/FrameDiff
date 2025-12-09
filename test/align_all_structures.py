@@ -27,7 +27,8 @@ from tqdm import tqdm
 
 
 def list_structures(input_dir: Path, extension: str) -> List[Path]:
-    files = sorted(p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == extension.lower())
+    """Recursively find all structure files with the given extension."""
+    files = sorted(p for p in input_dir.rglob(f"*{extension}") if p.is_file())
     return files
 
 
@@ -131,6 +132,15 @@ def write_summary(summary_path: Path, rows: List[Dict[str, Optional[float]]]) ->
             writer.writerow(row)
 
 
+def copy_reference(reference: Path, output_dir: Path) -> None:
+    """Copy the reference PDB into the output directory for bookkeeping."""
+    dest = output_dir / reference.name
+    if dest.resolve() == reference.resolve():
+        return
+    if not dest.exists():
+        shutil.copy2(reference, dest)
+
+
 def _ensure_tmalign_path(tmalign_bin: Path) -> Optional[Path]:
     if tmalign_bin.is_absolute() and tmalign_bin.exists():
         return tmalign_bin
@@ -207,6 +217,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    copy_reference(reference, output_dir)
 
     summary_rows: List[Dict[str, Optional[float]]] = []
     print("=" * 60)
