@@ -948,6 +948,7 @@ def plot_clustering_results(
     clusters: List[ClusterInfo],
     output_dir: Path,
     alpha: float,
+    clusterer = None,  # 新增参数：HDBSCAN聚类器对象
 ):
     """生成聚类可视化图"""
     plot_dir = output_dir / "plots"
@@ -967,7 +968,57 @@ def plot_clustering_results(
     plt.savefig(plot_dir / 'distance_matrix.png', dpi=150)
     plt.close()
     
-    # 2. t-SNE可视化
+    # 2. HDBSCAN聚类树 (新增)
+    if clusterer is not None and hasattr(clusterer, 'condensed_tree_'):
+        try:
+            print("  绘制HDBSCAN聚类树...")
+            
+            # 2.1 压缩树可视化
+            plt.figure(figsize=(12, 8))
+            clusterer.condensed_tree_.plot(
+                select_clusters=True,
+                selection_palette=sns.color_palette('deep', max(len(set(labels)) - 1, 8)) if sns else None,
+                cmap='viridis',
+                colorbar=True
+            )
+            plt.title('HDBSCAN Condensed Tree\n(Shows cluster formation hierarchy)')
+            plt.xlabel('Sample Index (sorted by similarity)')
+            plt.ylabel('Distance (λ)')
+            plt.tight_layout()
+            plt.savefig(plot_dir / 'hdbscan_condensed_tree.png', dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            # 2.2 单链接树 (如果可用)
+            if hasattr(clusterer, 'single_linkage_tree_'):
+                plt.figure(figsize=(12, 8))
+                clusterer.single_linkage_tree_.plot(cmap='viridis', colorbar=True)
+                plt.title('HDBSCAN Single Linkage Tree\n(Complete hierarchy of merges)')
+                plt.xlabel('Sample Index')
+                plt.ylabel('Distance')
+                plt.tight_layout()
+                plt.savefig(plot_dir / 'hdbscan_single_linkage_tree.png', dpi=150, bbox_inches='tight')
+                plt.close()
+            
+            # 2.3 最小生成树 (如果可用)
+            if hasattr(clusterer, 'minimum_spanning_tree_'):
+                plt.figure(figsize=(12, 8))
+                clusterer.minimum_spanning_tree_.plot(
+                    edge_cmap='viridis',
+                    edge_alpha=0.6,
+                    node_size=20,
+                    edge_linewidth=2
+                )
+                plt.title('HDBSCAN Minimum Spanning Tree\n(Graph representation of sample connectivity)')
+                plt.tight_layout()
+                plt.savefig(plot_dir / 'hdbscan_mst.png', dpi=150, bbox_inches='tight')
+                plt.close()
+            
+            print("  ✓ 聚类树可视化完成")
+            
+        except Exception as e:
+            print(f"  ✗ 聚类树可视化失败: {e}")
+    
+    # 3. t-SNE可视化
     if SKLEARN_AVAILABLE and len(samples) > 5:
         try:
             # 合并特征用于降维
@@ -997,7 +1048,6 @@ def plot_clustering_results(
             for idx, cluster_id in enumerate(unique_labels):
                 mask = labels == cluster_id
                 cluster_info = next((c for c in clusters if c.cluster_id == cluster_id), None)
-                
                 marker = '*' if cluster_info and cluster_info.is_multiconformer else 'o'
                 size = 100 if cluster_info and cluster_info.is_multiconformer else 50
                 
@@ -1020,7 +1070,7 @@ def plot_clustering_results(
         except Exception as e:
             print(f"t-SNE可视化失败: {e}")
     
-    # 3. 簇大小分布
+    # 4. 簇大小分布
     unique_labels = sorted(set(labels) - {-1})
     cluster_sizes = [np.sum(labels == l) for l in unique_labels]
     
@@ -1043,7 +1093,7 @@ def plot_clustering_results(
     plt.savefig(plot_dir / 'cluster_sizes.png', dpi=150)
     plt.close()
     
-    # 4. 每个多构象簇的TM-score热力图
+    # 5. 每个多构象簇的TM-score热力图
     multiconformer_clusters = [c for c in clusters if c.is_multiconformer]
     for cluster in multiconformer_clusters:
         if cluster.tm_score_matrix is not None and len(cluster.member_names) > 1:
@@ -1069,6 +1119,7 @@ def plot_clustering_results(
             plt.close()
     
     print(f"可视化图已保存到: {plot_dir}")
+
 
 
 # ============================================================================
@@ -1325,6 +1376,7 @@ def main():
         clusters=clusters,
         output_dir=args.output_dir,
         alpha=args.alpha,
+        clusterer=clusterer,  # 传递聚类器对象以绘制聚类树
     )
     
     # 保存聚类结果
