@@ -73,8 +73,8 @@ class SampleResult:
     pdb_path: Path
     chain_id: str
     seq_len: int
-    rot_score: np.ndarray  # Shape: (num_steps, L, 3, 3)
-    trans_score: np.ndarray  # Shape: (num_steps, L, 3)
+    rot_score: np.ndarray  # Shape: (L, 3, 3) - 只保存最后一步
+    trans_score: np.ndarray  # Shape: (L, 3) - 只保存最后一步
     final_coords: np.ndarray  # Shape: (L, 3)
     residue_mask: np.ndarray  # Shape: (L,)
 
@@ -381,8 +381,8 @@ def batched_direct_denoising(
     
     t_schedule = torch.linspace(min_t, max_t, num_steps, device=device)
 
-    rot_score_history = []
-    trans_score_history = []
+    final_rot_score = None
+    final_trans_score = None
     
     # 时间步占位符
     t_placeholder = torch.ones(B, device=device)
@@ -404,7 +404,7 @@ def batched_direct_denoising(
         feats["rot_score_scaling"] = torch.full((B,), float(rot_scale), device=device)
         feats["trans_score_scaling"] = torch.full((B,), float(trans_scale), device=device)
     
-    for t_value in t_schedule:
+    for step_idx, t_value in enumerate(t_schedule):
         set_t_feats(sample_feats, t_value.item())
         
         # 模型推理
@@ -415,8 +415,10 @@ def batched_direct_denoising(
         rot_score = model_out["rot_score"]  # (B, L, 3, 3)
         trans_score = model_out["trans_score"]  # (B, L, 3)
         
-        rot_score_history.append(rot_score.detach().cpu().numpy())
-        trans_score_history.append(trans_score.detach().cpu().numpy())
+        # 只保存最后一步
+        if step_idx == len(t_schedule) - 1:
+            final_rot_score = rot_score.detach().cpu().numpy()
+            final_trans_score = trans_score.detach().cpu().numpy()
         
         # 更新rigids（如果需要可以使用模型输出更新）
         # 这里暂时保持原rigids不变
@@ -425,8 +427,8 @@ def batched_direct_denoising(
     final_coords = sample_feats["rigids_t"][..., 4:].detach().cpu().numpy()  # (B, L, 3)
     
     return {
-        "rot_score_history": np.stack(rot_score_history, axis=1),
-        "trans_score_history": np.stack(trans_score_history, axis=1),
+        "rot_score": final_rot_score,  # (B, L, 3, 3)
+        "trans_score": final_trans_score,  # (B, L, 3)
         "final_coords": final_coords,
     }
 
@@ -473,8 +475,8 @@ def process_all_samples(
                 pdb_path=inp.pdb_path,
                 chain_id=inp.chain_id,
                 seq_len=L,
-                rot_score=batch_results["rot_score_history"][j, :, :L],
-                trans_score=batch_results["trans_score_history"][j, :, :L],
+                rot_score=batch_results["rot_score"][j, :L],
+                trans_score=batch_results["trans_score"][j, :L],
                 final_coords=batch_results["final_coords"][j, :L],
                 residue_mask=batched_input["seq_mask"][j, :L].cpu().numpy(),
             )
@@ -506,19 +508,19 @@ def extract_features(
         trans_score = sample.trans_score
         
         if pooling == "flatten":
-            rot_feat = rot_score.reshape(rot_score.shape[0], -1)
-            trans_feat = trans_score.reshape(trans_score.shape[0], -1)
+            # 直接展平所有残基
+            rot_feat = rot_score.reshape(-1)  # (length*9,)
+            trans_feat = trans_score.reshape(-1)  # (length*3,)
         elif pooling == "mean":
-            rot_feat = rot_score.mean(axis=1)
-            trans_feat = trans_score.mean(axis=1)
+            # 对残基维度取平均
+            rot_feat = rot_score.mean(axis=0).reshape(-1)  # (9,)
+            trans_feat = trans_score.mean(axis=0)  # (3,)
         elif pooling == "max":
-            rot_feat = rot_score.max(axis=1)
-            trans_feat = trans_score.max(axis=1)
+            # 对残基维度取最大值
+            rot_feat = rot_score.max(axis=0).reshape(-1)  # (9,)
+            trans_feat = trans_score.max(axis=0)  # (3,)
         else:
             raise ValueError(f"未知的池化方式: {pooling}")
-        
-        rot_feat = rot_feat.reshape(-1)
-        trans_feat = trans_feat.reshape(-1)
         
         rot_features.append(rot_feat)
         trans_features.append(trans_feat)
@@ -648,16 +650,25 @@ def detect_multi_conformations(
         rot_features, trans_features, alpha
     )
     
-    # 找到余弦距离小于阈值的配对
+    # *** 关键修改3: 只比较序列长度相同的蛋白质对 ***
     N = len(samples)
     candidate_pairs = []
+    skipped_due_to_length = 0
     
     for i in range(N):
         for j in range(i+1, N):
+            # 检查长度是否相同（多构象检测通常针对相同序列）
+            if samples[i].seq_len != samples[j].seq_len:
+                skipped_due_to_length += 1
+                continue
+            
             if combined_dist[i, j] < cosine_threshold:
                 candidate_pairs.append((i, j))
     
-    logging.info(f"发现 {len(candidate_pairs)} 对候选多构象对 (余弦距离 < {cosine_threshold})")
+    if skipped_due_to_length > 0:
+        logging.info(f"跳过 {skipped_due_to_length} 对不同长度的蛋白质")
+    
+    logging.info(f"发现 {len(candidate_pairs)} 对候选多构象对 (相同长度且余弦距离 < {cosine_threshold})")
     
     if not candidate_pairs:
         logging.info("没有发现符合余弦距离阈值的配对")
@@ -952,7 +963,7 @@ def main():
         )
     timing_info["去噪推理"] = time.time() - t0
     
-    logging.info(f"完成 {len(samples)} 个样本的去噪")
+    logging.info(f"完成 {len(samples)} 个样本的去噪（使用固定时间步，只保存最后一步score）")
     
     # 5. 提取特征
     logging.info("=" * 80)
