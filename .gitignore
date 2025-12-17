@@ -196,3 +196,4 @@ test/output_dir_stepwise_denoising/
 test/test_modified/
 test/random_batch_output/
 test/clustering_output/
+test/multi_conformation_output/
