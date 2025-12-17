@@ -379,6 +379,8 @@ def batched_direct_denoising(
     rigid_4x4[:, :, :3, 3] = noisy_trans
     rigids_t = ru.Rigid.from_tensor_4x4(rigid_4x4)
     
+    t_schedule = torch.linspace(min_t, max_t, num_steps, device=device)
+
     rot_score_history = []
     trans_score_history = []
     
@@ -402,9 +404,8 @@ def batched_direct_denoising(
         feats["rot_score_scaling"] = torch.full((B,), float(rot_scale), device=device)
         feats["trans_score_scaling"] = torch.full((B,), float(trans_scale), device=device)
     
-    for _ in range(num_steps):
-        t_value = torch.rand(1, device=device).item() * (max_t - min_t) + min_t
-        set_t_feats(sample_feats, t_value)
+    for t_value in t_schedule:
+        set_t_feats(sample_feats, t_value.item())
         
         # 模型推理
         with torch.no_grad():
@@ -791,14 +792,14 @@ def plot_results(
     tm_scores = [p.tm_score for p in multi_conf_pairs]
     
     plt.scatter(cosine_dists, tm_scores, alpha=0.6, s=100)
-    plt.xlabel("余弦距离", fontsize=12)
+    plt.xlabel("Cosine Distance", fontsize=12)
     plt.ylabel("TM-score", fontsize=12)
-    plt.title("多构象蛋白质: 梯度相似性 vs 结构相似性", fontsize=14)
+    plt.title("Multi-conformation: Gradient Similarity vs Structural Similarity", fontsize=14)
     plt.grid(True, alpha=0.3)
     
     # 添加阈值线
-    plt.axhline(y=0.7, color='r', linestyle='--', label='TM-score阈值')
-    plt.axvline(x=0.5, color='b', linestyle='--', label='余弦距离阈值')
+    plt.axhline(y=0.7, color='r', linestyle='--', label='TM-score threshold')
+    plt.axvline(x=0.5, color='b', linestyle='--', label='Cosine distance threshold')
     plt.legend()
     
     plt.tight_layout()
@@ -808,9 +809,9 @@ def plot_results(
     # 直方图: 余弦距离分布
     plt.figure(figsize=(10, 6))
     plt.hist(cosine_dists, bins=20, alpha=0.7, edgecolor='black')
-    plt.xlabel("余弦距离", fontsize=12)
-    plt.ylabel("数量", fontsize=12)
-    plt.title("余弦距离分布", fontsize=14)
+    plt.xlabel("Cosine Distance", fontsize=12)
+    plt.ylabel("Count", fontsize=12)
+    plt.title("Cosine Distance Distribution", fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(plots_dir / "cosine_distance_distribution.png", dpi=300, bbox_inches='tight')
@@ -820,8 +821,8 @@ def plot_results(
     plt.figure(figsize=(10, 6))
     plt.hist(tm_scores, bins=20, alpha=0.7, edgecolor='black', color='orange')
     plt.xlabel("TM-score", fontsize=12)
-    plt.ylabel("数量", fontsize=12)
-    plt.title("TM-score分布", fontsize=14)
+    plt.ylabel("Count", fontsize=12)
+    plt.title("TM-score Distribution", fontsize=14)
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(plots_dir / "tmscore_distribution.png", dpi=300, bbox_inches='tight')
