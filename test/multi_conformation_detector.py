@@ -25,6 +25,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+import random
 from pathlib import Path
 from multiprocessing import cpu_count
 from typing import Dict, List, Optional, Sequence, Tuple, Any
@@ -86,11 +87,12 @@ class PreparedInput:
     pdb_path: Path
     chain_id: str
     seq_len: int
-    aatype: np.ndarray
-    atom_positions: np.ndarray
-    atom_mask: np.ndarray
-    residue_index: np.ndarray
-    b_factors: np.ndarray
+    rigids_tensor: torch.Tensor  # Shape: (L, 7) - rigid frames
+    res_mask: torch.Tensor       # Shape: (L,) - residue mask
+    seq_idx: torch.Tensor        # Shape: (L,) - sequence indices
+    fixed_mask: torch.Tensor     # Shape: (L,) - fixed mask
+    torsion_angles: torch.Tensor # Shape: (L, 7, 2) - torsion angles
+    sc_ca: torch.Tensor          # Shape: (L, 3) - CA positions
 
 
 @dataclass
@@ -157,6 +159,8 @@ def parse_args() -> argparse.Namespace:
                         help="并行工作进程数")
     parser.add_argument("--max-samples", type=int, default=None,
                         help="最大样本数 (用于调试)")
+    parser.add_argument("--sample-size", type=int, default=None,
+                        help="随机采样数量 (优先于max-samples)")
     
     # 特征提取
     parser.add_argument("--pooling", type=str, default="flatten",
@@ -198,25 +202,22 @@ def resolve_chain_id(pdb_path: Path, preferred_chain: Optional[str]) -> Optional
 
 
 def process_chain_feats(pdb_feats):
-    """处理链特征"""
-    ca_idx = du.residue_constants.atom_order["CA"]
+    """处理PDB特征，生成完整的chain_feats用于去噪"""
     chain_feats = {
-        "aatype": torch.tensor(pdb_feats["aatype"]).long(),
-        "all_atom_positions": torch.tensor(pdb_feats["atom_positions"]).double(),
-        "all_atom_mask": torch.tensor(pdb_feats["atom_mask"]).double(),
+        'aatype': torch.tensor(pdb_feats['aatype']).long(),
+        'all_atom_positions': torch.tensor(pdb_feats['atom_positions']).double(),
+        'all_atom_mask': torch.tensor(pdb_feats['atom_mask']).double()
     }
     chain_feats = data_transforms.atom37_to_frames(chain_feats)
     chain_feats = data_transforms.make_atom14_masks(chain_feats)
     chain_feats = data_transforms.make_atom14_positions(chain_feats)
     chain_feats = data_transforms.atom37_to_torsion_angles()(chain_feats)
     
-    return {
-        "aatype": chain_feats["aatype"].numpy(),
-        "atom_positions": chain_feats["all_atom_positions"].numpy(),
-        "atom_mask": chain_feats["all_atom_mask"].numpy(),
-        "residue_index": pdb_feats["residue_index"],
-        "b_factors": pdb_feats["b_factors"][:, ca_idx],
-    }
+    seq_idx = pdb_feats['residue_index'] - np.min(pdb_feats['residue_index']) + 1
+    chain_feats['seq_idx'] = seq_idx
+    chain_feats['res_mask'] = pdb_feats['bb_mask']
+    chain_feats['residue_index'] = pdb_feats['residue_index']
+    return chain_feats
 
 
 def merge_chain_features(chain_feat_map: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
@@ -227,39 +228,52 @@ def merge_chain_features(chain_feat_map: Dict[str, Dict[str, np.ndarray]]) -> Di
 
 
 def prepare_single_input(pdb_path: Path, chain_id: Optional[str]) -> PreparedInput:
-    """预处理单个PDB文件"""
+    """预处理单个PDB文件 (参考 score_clustering_analyzer.py)"""
     try:
-        actual_chain = resolve_chain_id(pdb_path, chain_id)
-        if actual_chain is None:
-            raise ValueError(f"无法解析链ID: {pdb_path}")
-        
-        # 使用parse_pdb_feats函数直接解析PDB文件
-        pdb_feats_raw = du.parse_pdb_feats(
-            pdb_path.stem,
-            str(pdb_path),
-            chain_id=actual_chain
-        )
+        pdb_name = pdb_path.stem
+        effective_chain = resolve_chain_id(pdb_path, chain_id)
+        pdb_feats_raw = du.parse_pdb_feats(pdb_name, str(pdb_path), chain_id=effective_chain or None)
         
         # 检查是否为多链字典结构
         if isinstance(pdb_feats_raw, dict) and all(isinstance(v, dict) for v in pdb_feats_raw.values()):
-            # 多链结构，需要合并
-            chain_feat_map = {}
-            for cid, chain_pdb in pdb_feats_raw.items():
-                chain_feats = process_chain_feats(chain_pdb)
-                chain_feat_map[str(cid)] = chain_feats
-            merged_feats = merge_chain_features(chain_feat_map)
+            pdb_feats = merge_chain_features(pdb_feats_raw)
+            chain_label = "ALL"
         else:
-            # 单链结构
-            merged_feats = process_chain_feats(pdb_feats_raw)
+            pdb_feats = pdb_feats_raw
+            chain_label = effective_chain or "ALL"
         
-        seq_len = len(merged_feats["aatype"])
+        chain_feats = process_chain_feats(pdb_feats)
+        bb_mask = np.asarray(pdb_feats['bb_mask']).astype(bool)
+        num_res = int(bb_mask.sum())
+        
+        if num_res == 0:
+            raise ValueError(f"{pdb_path} 不包含有效主链残基")
+        
+        # 从 rigidgroups_gt_frames 提取 rigid frames (关键!)
+        mask_tensor = torch.from_numpy(bb_mask).to(torch.bool)
+        rigid_frames = chain_feats['rigidgroups_gt_frames'][mask_tensor, 0].detach().cpu().float()
+        rigids_0 = ru.Rigid.from_tensor_4x4(rigid_frames)
+        rigids_tensor = rigids_0.to_tensor_7()
+        sc_ca_init = rigids_0.get_trans().detach().cpu().float()
+        
+        # 提取 torsion angles
+        torsion_angles = chain_feats['torsion_angles_sin_cos'].detach().cpu().numpy()[bb_mask]
+        if torsion_angles.dtype == np.object_:
+            torsion_angles = np.stack([x.astype(np.float32) for x in torsion_angles], axis=0)
+        else:
+            torsion_angles = torsion_angles.astype(np.float32)
         
         return PreparedInput(
-            name=pdb_path.stem,
+            name=f"{pdb_name}_{chain_label}",
             pdb_path=pdb_path,
-            chain_id=actual_chain,
-            seq_len=seq_len,
-            **merged_feats
+            chain_id=chain_label,
+            seq_len=num_res,
+            rigids_tensor=rigids_tensor.float(),
+            res_mask=torch.ones(num_res, dtype=torch.float32),
+            seq_idx=torch.arange(1, num_res + 1, dtype=torch.float32),
+            fixed_mask=torch.zeros(num_res, dtype=torch.float32),
+            torsion_angles=torch.tensor(torsion_angles, dtype=torch.float32),
+            sc_ca=sc_ca_init,
         )
     except Exception as e:
         logging.error(f"预处理失败 {pdb_path}: {e}")
@@ -322,25 +336,35 @@ def create_batched_input(
     device: torch.device,
     use_fp16: bool = False
 ) -> Dict[str, torch.Tensor]:
-    """创建批量输入"""
+    """创建批量输入 (参考 score_clustering_analyzer.py)"""
     dtype = torch.float16 if use_fp16 else torch.float32
     
-    aatype_list = [torch.tensor(inp.aatype, dtype=torch.long) for inp in inputs]
-    pos_list = [torch.tensor(inp.atom_positions, dtype=dtype) for inp in inputs]
-    mask_list = [torch.tensor(inp.atom_mask, dtype=dtype) for inp in inputs]
-    residue_index_list = [torch.tensor(inp.residue_index, dtype=torch.long) for inp in inputs]
+    # 提取各个特征列表
+    rigids_list = [inp.rigids_tensor for inp in inputs]
+    res_mask_list = [inp.res_mask for inp in inputs]
+    seq_idx_list = [inp.seq_idx for inp in inputs]
+    fixed_mask_list = [inp.fixed_mask for inp in inputs]
+    torsion_list = [inp.torsion_angles for inp in inputs]
+    sc_ca_list = [inp.sc_ca for inp in inputs]
     
-    aatype_batch, _ = pad_to_max_length(aatype_list, pad_value=0)
-    pos_batch, pos_mask = pad_to_max_length(pos_list, pad_value=0.0)
-    mask_batch, _ = pad_to_max_length(mask_list, pad_value=0.0)
-    residue_index_batch, _ = pad_to_max_length(residue_index_list, pad_value=0)
+    # Padding
+    rigids_batch, _ = pad_to_max_length(rigids_list, pad_value=0.0)
+    res_mask_batch, mask_for_lengths = pad_to_max_length(res_mask_list, pad_value=0.0)
+    seq_idx_batch, _ = pad_to_max_length(seq_idx_list, pad_value=0)
+    fixed_mask_batch, _ = pad_to_max_length(fixed_mask_list, pad_value=0.0)
+    torsion_batch, _ = pad_to_max_length(torsion_list, pad_value=0.0)
+    sc_ca_batch, _ = pad_to_max_length(sc_ca_list, pad_value=0.0)
+    
+    lengths = torch.tensor([inp.seq_len for inp in inputs], dtype=torch.long)
     
     return {
-        "aatype": aatype_batch.to(device),
-        "atom_positions": pos_batch.to(device),
-        "atom_mask": mask_batch.to(device),
-        "residue_index": residue_index_batch.to(device),
-        "seq_mask": pos_mask.to(device),
+        "rigids_t": rigids_batch.to(device=device, dtype=dtype),
+        "res_mask": res_mask_batch.to(device=device, dtype=dtype),
+        "seq_idx": seq_idx_batch.to(device=device, dtype=dtype),
+        "fixed_mask": fixed_mask_batch.to(device=device, dtype=dtype),
+        "torsion_angles_sin_cos": torsion_batch.to(device=device, dtype=dtype),
+        "sc_ca_t": sc_ca_batch.to(device=device, dtype=dtype),
+        "lengths": lengths.to(device),
     }
 
 
@@ -355,81 +379,87 @@ def batched_direct_denoising(
     enable_self_conditioning: bool,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """批量去噪"""
-    B, L = batched_input["seq_mask"].shape
+    """批量直接去噪 (参考 score_clustering_analyzer.py)"""
+    batch_size = batched_input['rigids_t'].shape[0]
+    lengths = batched_input['lengths']
     
-    # 从atom37坐标创建初始rigid frames
-    gt_pos = batched_input["atom_positions"]
-    ca_idx = 1  # CA在atom37中的索引
-    ca_pos = gt_pos[:, :, ca_idx, :]  # (B, L, 3)
+    # 复制输入特征
+    sample_feats = {k: v.clone() if isinstance(v, torch.Tensor) else v 
+                    for k, v in batched_input.items() if k != 'lengths'}
     
-    # 创建初始rigid frames
-    identity_rots = torch.eye(3, device=device)[None, None, :, :].repeat(B, L, 1, 1)
+    # 去噪时间步从 max_t 到 min_t
+    denoising_steps = np.linspace(max_t, min_t, num_steps)
+    dt = (max_t - min_t) / max(num_steps - 1, 1)
     
-    if noise_scale > 0:
-        noisy_rots = identity_rots + torch.randn_like(identity_rots) * noise_scale
-        noisy_trans = ca_pos + torch.randn_like(ca_pos) * noise_scale
-    else:
-        noisy_rots = identity_rots
-        noisy_trans = ca_pos
+    # 计算 diffuse_mask
+    diffuse_mask = ((1 - sample_feats['fixed_mask']) * sample_feats['res_mask']).detach().cpu().numpy()
+    t_placeholder = torch.ones(batch_size, device=device, dtype=sample_feats['rigids_t'].dtype)
     
-    # 创建4x4变换矩阵并转为Rigid对象
-    rigid_4x4 = torch.eye(4, device=device)[None, None, :, :].repeat(B, L, 1, 1)
-    rigid_4x4[:, :, :3, :3] = noisy_rots
-    rigid_4x4[:, :, :3, 3] = noisy_trans
-    rigids_t = ru.Rigid.from_tensor_4x4(rigid_4x4)
+    # 检查是否启用自条件
+    embed_self_conditioning = (
+        enable_self_conditioning and
+        getattr(model.embedding_layer._embed_conf, 'embed_self_conditioning', False)
+    )
     
-    t_schedule = torch.linspace(min_t, max_t, num_steps, device=device)
-
-    final_rot_score = None
-    final_trans_score = None
-    
-    # 时间步占位符
-    t_placeholder = torch.ones(B, device=device)
-    
-    # 准备sample_feats字典
-    sample_feats = {
-        "res_mask": batched_input["seq_mask"],
-        "seq_idx": batched_input["residue_index"],
-        "fixed_mask": torch.zeros_like(batched_input["seq_mask"]),
-        "torsion_angles_sin_cos": torch.zeros(B, L, 7, 2, device=device),
-        "sc_ca_t": torch.zeros(B, L, 3, device=device),
-        "rigids_t": rigids_t.to_tensor_7(),
-    }
-    
-    # 设置时间相关特征的辅助函数
     def set_t_feats(feats, t_value):
-        feats["t"] = t_placeholder * float(t_value)
+        dtype = feats['rigids_t'].dtype
+        feats['t'] = t_placeholder * float(t_value)
         rot_scale, trans_scale = diffuser.score_scaling(float(t_value))
-        feats["rot_score_scaling"] = torch.full((B,), float(rot_scale), device=device)
-        feats["trans_score_scaling"] = torch.full((B,), float(trans_scale), device=device)
+        feats['rot_score_scaling'] = torch.full((batch_size,), float(rot_scale), device=device, dtype=dtype)
+        feats['trans_score_scaling'] = torch.full((batch_size,), float(trans_scale), device=device, dtype=dtype)
+        return feats
     
-    for step_idx, t_value in enumerate(t_schedule):
-        set_t_feats(sample_feats, t_value.item())
+    final_rot_scores = [None] * batch_size
+    final_trans_scores = [None] * batch_size
+    
+    with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == 'cuda')):
+        # 自条件初始化
+        if embed_self_conditioning and len(denoising_steps) > 0:
+            set_t_feats(sample_feats, denoising_steps[0])
+            model_sc = model(sample_feats)
+            sample_feats['sc_ca_t'] = model_sc['rigids'][..., 4:]
         
-        # 模型推理
-        with torch.no_grad():
+        # 去噪循环
+        for step_idx, t in enumerate(denoising_steps):
+            set_t_feats(sample_feats, t)
             model_out = model(sample_feats)
-        
-        # 从模型输出获取score
-        rot_score = model_out["rot_score"]  # (B, L, 3, 3)
-        trans_score = model_out["trans_score"]  # (B, L, 3)
-        
-        # 只保存最后一步
-        if step_idx == len(t_schedule) - 1:
-            final_rot_score = rot_score.detach().cpu().numpy()
-            final_trans_score = trans_score.detach().cpu().numpy()
-        
-        # 更新rigids（如果需要可以使用模型输出更新）
-        # 这里暂时保持原rigids不变
+            rot_score = model_out['rot_score']
+            trans_score = model_out['trans_score']
+            
+            # 保存最后一步的分数
+            if step_idx == len(denoising_steps) - 1:
+                rot_score_np = rot_score.detach().cpu().float().numpy()
+                trans_score_np = trans_score.detach().cpu().float().numpy()
+                
+                for i in range(batch_size):
+                    length = lengths[i].item()
+                    final_rot_scores[i] = rot_score_np[i, :length].copy()
+                    final_trans_scores[i] = trans_score_np[i, :length].copy()
+            
+            # 执行去噪步骤 (更新 rigids)
+            if t > min_t and step_idx < len(denoising_steps) - 1:
+                current_rigid = ru.Rigid.from_tensor_7(sample_feats['rigids_t'])
+                rigids_t = diffuser.reverse(
+                    rigid_t=current_rigid,
+                    rot_score=du.move_to_np(rot_score),
+                    trans_score=du.move_to_np(trans_score),
+                    diffuse_mask=diffuse_mask,
+                    t=float(t),
+                    dt=dt,
+                    center=True,
+                    noise_scale=noise_scale,
+                )
+                sample_feats['rigids_t'] = rigids_t.to_tensor_7().to(device=device, dtype=sample_feats['rigids_t'].dtype)
+                if embed_self_conditioning:
+                    sample_feats['sc_ca_t'] = model_out['rigids'][..., 4:]
     
-    # 提取最终坐标（CA位置）
-    final_coords = sample_feats["rigids_t"][..., 4:].detach().cpu().numpy()  # (B, L, 3)
+    # 提取最终坐标
+    final_coords = sample_feats['rigids_t'][..., 4:].detach().cpu().numpy()
     
     return {
-        "rot_score": final_rot_score,  # (B, L, 3, 3)
-        "trans_score": final_trans_score,  # (B, L, 3)
-        "final_coords": final_coords,
+        'final_rot_scores': final_rot_scores,
+        'final_trans_scores': final_trans_scores,
+        'final_coords': final_coords,
     }
 
 
@@ -475,10 +505,10 @@ def process_all_samples(
                 pdb_path=inp.pdb_path,
                 chain_id=inp.chain_id,
                 seq_len=L,
-                rot_score=batch_results["rot_score"][j, :L],
-                trans_score=batch_results["trans_score"][j, :L],
+                rot_score=batch_results["final_rot_scores"][j],
+                trans_score=batch_results["final_trans_scores"][j],
                 final_coords=batch_results["final_coords"][j, :L],
-                residue_mask=batched_input["seq_mask"][j, :L].cpu().numpy(),
+                residue_mask=batched_input["res_mask"][j, :L].cpu().numpy(),
             )
             results.append(result)
             
@@ -872,12 +902,20 @@ def main():
     logging.info("=" * 80)
     
     t0 = time.time()
-    pdb_files = sorted(args.source_dir.rglob("*.pdb"))
+    all_pdb_files = sorted(args.source_dir.rglob("*.pdb"))
+    total_found = len(all_pdb_files)
     
-    if args.max_samples:
-        pdb_files = pdb_files[:args.max_samples]
-    
-    logging.info(f"发现 {len(pdb_files)} 个PDB文件")
+    # 优先使用 sample-size 进行随机采样，否则使用 max-samples 顺序截取
+    if args.sample_size and args.sample_size < total_found:
+        rng = random.Random(args.seed)
+        pdb_files = rng.sample(all_pdb_files, args.sample_size)
+        logging.info(f"从 {total_found} 个PDB文件中随机采样 {args.sample_size} 个")
+    elif args.max_samples and args.max_samples < total_found:
+        pdb_files = all_pdb_files[:args.max_samples]
+        logging.info(f"从 {total_found} 个PDB文件中顺序选取前 {args.max_samples} 个")
+    else:
+        pdb_files = all_pdb_files
+        logging.info(f"使用全部 {total_found} 个PDB文件")
     timing_info["扫描文件"] = time.time() - t0
     
     if not pdb_files:
